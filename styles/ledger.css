@@ -106,5 +106,6 @@
 .pcl-app .pcl-archive-log button, .pcl-app .pcl-archive-log [data-action] { pointer-events: none; }
 .pcl-app .pcl-archive-log .message-delete, .pcl-app .pcl-archive-log .message-dismiss { display: none; }
 .pcl-app .pcl-archive-log .message-timestamp { white-space: nowrap; }
+.pcl-app .pcl-archive-log .message-header .whisper-to { flex: 0 0 100%; font-size: 12px; opacity: 0.8; }
 .pcl-app .pcl-more { margin: 10px auto 0; display: block; width: auto; padding: 0 12px; line-height: 26px; }
 .pcl-check { display: flex; gap: 6px; align-items: center; margin: 8px 0 0; }

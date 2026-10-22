@@ -2009,7 +2009,7 @@ class LedgerApp extends foundry.applications.api.ApplicationV2 {
         <td><a data-action="viewSession" data-id="${s.id}" data-tooltip="Show this session"><i class="fa-solid fa-eye"></i></a> ${chatIcon(s)}${gm}</td></tr>`;
     }).join("");
     const arcs = this.isGM
-      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${a.id}" value="${esc(a.name)}"></td><td>${ix.sessions.filter((s) => s.arc === a.id).length} sessions</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
+      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${a.id}" value="${esc(a.name)}"></td><td>${((n) => `${n} session${n === 1 ? "" : "s"}`)(ix.sessions.filter((s) => s.arc === a.id).length)}</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
       : "";
     const tools = this.isGM
       ? `<div class="pcl-tools"><button type="button" data-action="exportData"><i class="fa-solid fa-file-export"></i> Export everything</button>

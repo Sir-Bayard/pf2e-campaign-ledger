@@ -2,12 +2,13 @@
   "id": "pf2e-campaign-ledger",
   "title": "PF2e Campaign Ledger",
   "description": "<p>Long-term table statistics for Pathfinder 2e: attacks, crits, damage dealt and taken, healing, kills, downed and dying, saves, skills, spells, natural 20s and 1s, rerolls and Hero Points. Grouped by session, arc and encounter, viewed in a dashboard window, with reset, export and a read-only player view. Ending a session can archive the chat log with it and clear the chat, so long campaigns stay quick; the GM reads archived chat from the Sessions tab.</p>",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "url": "https://github.com/Sir-Bayard/pf2e-campaign-ledger",
   "manifest": "https://github.com/Sir-Bayard/pf2e-campaign-ledger/releases/latest/download/module.json",
   "download": "https://github.com/Sir-Bayard/pf2e-campaign-ledger/releases/latest/download/module.zip",
   "bugs": "https://github.com/Sir-Bayard/pf2e-campaign-ledger/issues",
   "readme": "https://github.com/Sir-Bayard/pf2e-campaign-ledger#readme",
+  "changelog": "https://github.com/Sir-Bayard/pf2e-campaign-ledger/blob/main/CHANGELOG.md",
   "license": "https://github.com/Sir-Bayard/pf2e-campaign-ledger/blob/main/LICENSE",
   "authors": [
     {
