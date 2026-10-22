@@ -1,0 +1,110 @@
+/* PF2e Campaign Ledger. Everything is scoped under .pcl-app, and common elements are reset
+   because some modules ship unscoped rules for span, i, a and label that would otherwise leak in. */
+
+.application.pcl-app .window-content { padding: 0; display: flex; flex-direction: column; overflow: hidden; }
+.pcl-app .pcl { display: flex; flex-direction: column; height: 100%; min-height: 0; font-size: 13px; }
+.pcl-app .pcl a { cursor: pointer; text-decoration: none; text-transform: none; flex: 0 0 auto; }
+.pcl-app .pcl i { position: static; display: inline-block; width: auto; }
+.pcl-app .pcl span, .pcl-app .pcl strong { overflow: visible; text-overflow: clip; white-space: normal; flex: initial; }
+.pcl-app .pcl label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 13px; }
+
+.pcl-app .pcl-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border, #7a7971); }
+.pcl-app .pcl-scope { display: flex; gap: 6px; align-items: center; }
+.pcl-app .pcl-scope select { min-width: 240px; }
+.pcl-app .pcl-gm { display: flex; gap: 6px; align-items: center; margin-left: auto; }
+.pcl-app .pcl-gm button, .pcl-app .pcl-scope button, .pcl-app .pcl-tools button { width: auto; flex: 0 0 auto; padding: 0 8px; line-height: 26px; }
+.pcl-app .pcl .pcl-live { color: #c0392b; font-weight: 600; white-space: nowrap; }
+.pcl-app .pcl-live i { font-size: 9px; vertical-align: middle; }
+.pcl-app .pcl .pcl-idle { opacity: 0.7; font-style: italic; }
+
+.pcl-app .pcl-tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--color-border, #7a7971); }
+.pcl-app .pcl .pcl-tabs a { padding: 6px 12px; border-bottom: 2px solid transparent; opacity: 0.75; background: none; }
+.pcl-app .pcl .pcl-tabs a.active { border-bottom-color: var(--color-text-hyperlink, #ff6400); opacity: 1; font-weight: 600; }
+
+.pcl-app .pcl-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 16px; }
+.pcl-app .pcl-body h3 { margin: 14px 0 6px; font-size: 14px; border-bottom: 1px solid rgba(127, 127, 127, 0.35); }
+.pcl-app .pcl-empty { opacity: 0.7; font-style: italic; }
+.pcl-app .pcl-note { opacity: 0.65; font-size: 11px; margin-top: 6px; }
+
+.pcl-app .pcl-table { width: 100%; border-collapse: collapse; margin: 0; }
+.pcl-app .pcl-table th, .pcl-app .pcl-table td { padding: 4px 6px; text-align: center; border-bottom: 1px solid rgba(127, 127, 127, 0.25); white-space: nowrap; }
+.pcl-app .pcl-table th { font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--color-bg, rgba(30, 30, 30, 0.95)); z-index: 1; }
+.pcl-app .pcl-table td.pcl-name, .pcl-app .pcl-table th:first-child { text-align: left; }
+.pcl-app .pcl-table tbody tr:hover { background: rgba(255, 255, 255, 0.05); }
+.pcl-app .pcl-party th[data-action] { cursor: pointer; }
+.pcl-app .pcl-party th.pcl-group { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; border-bottom: none; }
+.pcl-app .pcl-lead { font-weight: 700; color: var(--color-text-hyperlink, #ff6400); }
+.pcl-app .pcl-click { cursor: pointer; }
+.pcl-app .pcl-enc td.pcl-name a { opacity: 0.5; margin-left: 4px; }
+.pcl-app .pcl-enc td.pcl-name a:hover { opacity: 1; }
+.pcl-app .pcl-detail > td { padding: 6px 12px 12px; background: rgba(0, 0, 0, 0.12); }
+.pcl-app .pcl-foe td { opacity: 0.8; font-style: italic; }
+.pcl-app .pcl-table input[type="text"] { width: 100%; min-width: 160px; }
+
+.pcl-app .pcl-cards { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.pcl-app .pcl-card { display: flex; align-items: center; gap: 10px; padding: 6px 12px; min-width: 140px; max-width: 260px; border: 1px solid rgba(127, 127, 127, 0.35); border-radius: 6px; }
+.pcl-app .pcl-card > i { font-size: 18px; opacity: 0.7; width: 22px; text-align: center; }
+.pcl-app .pcl-card > div { display: flex; flex-direction: column; min-width: 0; }
+.pcl-app .pcl .pcl-card-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; }
+.pcl-app .pcl-card strong { font-size: 14px; line-height: 1.25; }
+.pcl-app .pcl .pcl-card-sub { font-size: 11px; opacity: 0.85; }
+
+.pcl-app .pcl-char-head { margin-bottom: 8px; }
+.pcl-app .pcl-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; margin-bottom: 6px; }
+.pcl-app .pcl-fact { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dotted rgba(127, 127, 127, 0.35); padding: 2px 0; }
+.pcl-app .pcl-fact span { opacity: 0.75; }
+.pcl-app .pcl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 0 20px; }
+
+.pcl-app .pcl-tools { display: flex; gap: 8px; margin-top: 16px; }
+.pcl-app .pcl-danger { color: #c0392b; }
+
+/* Round-by-round log */
+.pcl-app .pcl-log { max-height: 320px; overflow: auto; padding-right: 6px; }
+.pcl-app .pcl-round h4 { margin: 8px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; border: none; }
+.pcl-app .pcl-round ul { margin: 0; padding-left: 18px; }
+.pcl-app .pcl-round li { white-space: normal; text-align: left; line-height: 1.5; }
+.pcl-app .pcl-round li.pcl-foe-line { opacity: 0.75; font-style: italic; }
+
+/* Dice */
+.pcl-app .pcl-dice { display: grid; grid-template-columns: 200px 1fr; gap: 16px; align-items: start; }
+.pcl-app .pcl-dice-list { display: flex; flex-direction: column; gap: 2px; border-right: 1px solid rgba(127, 127, 127, 0.25); padding-right: 8px; }
+.pcl-app .pcl .pcl-dice-list a { padding: 4px 8px; border-radius: 4px; opacity: 0.8; }
+.pcl-app .pcl .pcl-dice-list a:hover { background: rgba(255, 255, 255, 0.06); opacity: 1; }
+.pcl-app .pcl .pcl-dice-list a.active { background: rgba(255, 255, 255, 0.1); opacity: 1; font-weight: 600; }
+.pcl-app .pcl-dice-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.pcl-app .pcl-dice-top strong { font-size: 15px; }
+.pcl-app .pcl-tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.pcl-app .pcl-tile { display: flex; flex-direction: column; padding: 4px 10px; min-width: 84px; border: 1px solid rgba(127, 127, 127, 0.35); border-radius: 6px; }
+.pcl-app .pcl .pcl-tile span { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; }
+.pcl-app .pcl-tile strong { font-size: 15px; }
+.pcl-app .pcl-chart { margin: 0; }
+.pcl-app .pcl-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+.pcl-app .pcl-chart .pcl-bar { fill: #cc7a2a; }
+.pcl-app.theme-light .pcl-chart .pcl-bar, .theme-light .pcl-app .pcl-chart .pcl-bar { fill: #a95a14; }
+.pcl-app .pcl-chart .pcl-hit { fill: transparent; cursor: default; }
+.pcl-app .pcl-chart .pcl-hit:hover { fill: rgba(255, 255, 255, 0.05); }
+.pcl-app .pcl-chart .pcl-grid-line { stroke: currentColor; stroke-opacity: 0.12; stroke-width: 1; }
+.pcl-app .pcl-chart .pcl-axis { fill: currentColor; fill-opacity: 0.7; font-size: 11px; }
+.pcl-app .pcl-chart .pcl-expected { stroke: currentColor; stroke-opacity: 0.6; stroke-width: 1.5; stroke-dasharray: 5 4; }
+.pcl-app .pcl-chart .pcl-expected-label { fill-opacity: 0.8; font-style: italic; }
+
+/* Session recap card (in chat, so it isn't scoped to the ledger window) */
+.pcl-recap h3 { margin: 0 0 2px; font-size: 15px; border-bottom: 1px solid rgba(127, 127, 127, 0.4); padding-bottom: 2px; }
+.pcl-recap .pcl-recap-sub { margin: 2px 0 6px; font-size: 11px; opacity: 0.75; }
+.pcl-recap ul { margin: 0; padding-left: 16px; }
+.pcl-recap li { margin: 2px 0; }
+
+/* Chat archive window */
+.application.pcl-archive-app .window-content { padding: 0; }
+.pcl-app .pcl-archive-head { gap: 6px 10px; }
+.pcl-app .pcl-archive-head select[name=sid] { min-width: 0; flex: 1 1 200px; }
+.pcl-app .pcl-archive-head input[type=search] { flex: 1 1 120px; min-width: 0; }
+.pcl-app .pcl-archive-head select[name=who] { flex: 0 1 140px; min-width: 0; }
+.pcl-app .pcl .pcl-archive-count { opacity: 0.7; font-size: 12px; white-space: nowrap; }
+.pcl-app .pcl-archive-log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.pcl-app .pcl-archive-log .chat-message { margin: 0; }
+.pcl-app .pcl-archive-log button, .pcl-app .pcl-archive-log [data-action] { pointer-events: none; }
+.pcl-app .pcl-archive-log .message-delete, .pcl-app .pcl-archive-log .message-dismiss { display: none; }
+.pcl-app .pcl-archive-log .message-timestamp { white-space: nowrap; }
+.pcl-app .pcl-more { margin: 10px auto 0; display: block; width: auto; padding: 0 12px; line-height: 26px; }
+.pcl-check { display: flex; gap: 6px; align-items: center; margin: 8px 0 0; }
