@@ -878,12 +878,45 @@ function heroReroll(w) {
   return true;
 }
 
+/**
+ * The spell or ability and the creature behind a Target Helper card, the same on a spell card and on the damage card
+ * Toolbelt copies its saves to. Toolbelt leaves both empty on a spell card and, on the damage card, sets the item to
+ * the spell's uuid (the card's spell, or a scroll's or wand's embedded spell) and leaves the author empty.
+ */
+function saveSource(msg) {
+  const th = msg.flags?.["pf2e-toolbelt"]?.targetHelper ?? {};
+  let spell = null;
+  try {
+    const it = msg.item;
+    spell = it?.isOfType?.("spell") ? it : it?.isOfType?.("consumable") ? it.embeddedSpell : null;
+  } catch (e) {
+    spell = null;
+  }
+  return { item: th.item ?? spell?.uuid ?? "", author: th.author ?? msg.actor?.uuid ?? "" };
+}
+
+/** A short, stable hash of a string (FNV-1a), to keep save keys small. */
+function hashOf(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * Who gets the credit for a change to a creature's HP: the last one to hit (or heal) it within the window, else
+ * whoever's turn it is, but only from the other side for damage and the same side for healing. Otherwise nobody:
+ * unattributed is better than wrong in a window players read.
+ */
 function attribution(actor, map) {
   const entry = map.get(actor.uuid);
   if (entry && now() - entry.t < ATTRIBUTION_WINDOW) return entry.w;
   const c = game.combat?.combatant;
-  if (c?.actor && c.actor.uuid !== actor.uuid) return who(c.actor, c.token);
-  return null;
+  if (!c?.actor || c.actor.uuid === actor.uuid) return null;
+  const by = who(c.actor, c.token);
+  const v = who(actor);
+  if (!by || !v) return null;
+  const heal = map === Rec.lastHeal;
+  return (heal ? by.p === v.p : by.p !== v.p) ? by : null;
 }
 
 function hpSnap(actor) {
@@ -957,8 +990,10 @@ async function onChatMessage(msg) {
     const tActor = actorFromUuid(ctx.target?.actor);
     const tTok = ctx.target?.token ? fromUuidSync(ctx.target.token) : null;
     const tw = tActor ? who(tActor, tTok) : null;
-    if (tActor) Rec.lastHit.set(tActor.uuid, { w, t: now() });
-    const ev = await record({ k: "atk", a: w, tg: tw, o: degree(ctx.outcome), nat: natD20(roll), fx: twice(roll), it: msg.item?.name ?? null });
+    const o = degree(ctx.outcome);
+    // Only a hit counts as the last hit on the target (a miss shouldn't take the credit for hand-applied damage)
+    if (tActor && (o === null || o >= 2)) Rec.lastHit.set(tActor.uuid, { w, t: now() });
+    const ev = await record({ k: "atk", a: w, tg: tw, o, nat: natD20(roll), fx: twice(roll), it: msg.item?.name ?? null });
     if (ev) Rec.lastCheck.set(`${w.k}|${type}`, ev);
     return;
   }
@@ -1036,7 +1071,21 @@ async function onDamageApplied(msg, flags) {
   if (!applied || applied.isReverted) return;
   const target = msg.actor;
   const src = actorFromUuid(flags.origin?.actor);
-  if (!target || !src) return;
+  if (!target) return;
+  // The HP change recorded a moment ago belongs to this card only if the card changed HP (a card can be all shield
+  // or only persistent damage), and to one card only.
+  const hpPath = (applied.updates ?? []).some((u) => u.path === "system.attributes.hp.value" || u.path === "system.attributes.hp.temp");
+  let recent = hpPath ? Rec.recent.get(target.uuid) : null;
+  if (recent && now() - recent.t > 5000) recent = null;
+  if (recent) Rec.recent.delete(target.uuid);
+  if (!src) {
+    // No source on the card: nothing to credit, but what it changed is still the card's, for its Revert button.
+    if (!recent) return;
+    for (const ev of recent.evs) ev.m ??= msg.id;
+    const s = await activeSession({ create: false });
+    if (s) Store.scheduleSave(s.id);
+    return;
+  }
   const amt = (applied.updates ?? [])
     .filter((u) => u.path === "system.attributes.hp.value" || u.path === "system.attributes.hp.temp")
     .reduce((x, u) => x + Math.abs(Number(u.value) || 0), 0);
@@ -1054,11 +1103,12 @@ async function onDamageApplied(msg, flags) {
     const src = tick && now() - tick.t <= 15000 ? tick.by : last?.w;
     if (src && src.k !== a.k) { a = src; pd = true; }
   }
-  if (amt > 0) await record({ k: heal ? "healdone" : "dealt", a, tg, amt, it: pd ? "persistent damage" : (item?.name ?? null), ...(pd ? { pd: true } : {}) });
+  // Each event this card accounts for carries its message id (m), so the card's Revert button can take them back.
+  if (amt > 0) await record({ k: heal ? "healdone" : "dealt", a, tg, amt, it: pd ? "persistent damage" : (item?.name ?? null), ...(pd ? { pd: true } : {}), m: msg.id });
 
-  const recent = Rec.recent.get(target.uuid);
-  if (!recent || now() - recent.t > 5000) return;
+  if (!recent) return;
   for (const ev of recent.evs) {
+    ev.m ??= msg.id;
     if (!heal && (ev.k === "taken" || ev.k === "down")) ev.by = a;
     if (!heal && ev.k === "kill") ev.a = a;
     if (heal && (ev.k === "healed" || ev.k === "up")) ev.by = a;
@@ -1068,12 +1118,29 @@ async function onDamageApplied(msg, flags) {
 }
 
 /**
+ * PF2e's Revert button on a "takes X damage" or "is healed" card puts the HP back (an actor update marked
+ * damageUndo, which onUpdateActor leaves alone) and then marks the card reverted. Everything recorded for that
+ * card goes: the damage or healing dealt, the damage or healing taken, and a kill, down or revive it caused.
+ */
+async function onDamageReverted(msg) {
+  const s = await activeSession({ create: false });
+  if (!s) return;
+  const data = await Store.load(s.id);
+  const before = data.events.length;
+  data.events = data.events.filter((e) => e.m !== msg.id);
+  if (data.events.length === before) return;
+  Store.scheduleSave(s.id);
+  refreshOpenApps();
+}
+
+/**
  * Saves rolled through PF2e Toolbelt's Target Helper don't post their own message. Toolbelt writes
  * them into the spell or damage card's flags instead, so they're picked up here. Each save is keyed
  * to its card and token, so a reroll updates the earlier result instead of counting twice.
  */
 async function onUpdateChatMessage(msg, changes) {
   if (!isRecorder() || !recording()) return;
+  if (changes.flags?.pf2e?.appliedDamage?.isReverted === true) return onDamageReverted(msg);
 
   const tagged = changes.flags?.[MOD]?.ability;
   if (tagged && !Rec.seen.has(`ability|${msg.id}`)) {
@@ -1087,18 +1154,34 @@ async function onUpdateChatMessage(msg, changes) {
   const s = await activeSession();
   const data = await Store.load(s.id);
   const WINDOW = 10 * 60 * 1000;
+  const COPY_WINDOW = 3 * 60 * 1000;
   const recent = (e) => now() - (e.t ?? 0) < WINDOW;
+  const source = saveSource(msg);
   for (const v of Object.values(variants)) {
     for (const [tokenId, save] of Object.entries(v?.saves ?? {})) {
       const tok = scene?.tokens.get(tokenId);
       if (!tok?.actor) continue;
       const stat = save.statistic ?? v.statistic ?? null;
-      // Toolbelt copies the saves from a spell card onto its damage card, so a save is identified by
-      // what was rolled (token, save, die and total), not by the card it sits on.
-      const key = `${tokenId}|${stat}|${save.die}|${save.value}`;
-      const known = (e) => e.k === "save" && recent(e) && (e.src === key || e.alt?.includes(key));
-      if (Rec.seen.has(key) || data.events.some(known)) continue;
-      Rec.seen.add(key);
+      // Toolbelt copies the saves from a spell card onto its damage card. A copy is the same roll (Toolbelt keeps the
+      // roll's JSON) for the same spell or ability and author, seen on another card within a few minutes; on the same
+      // card it's the same save at any age. Two real saves that roll the same can't then be taken for one another
+      // unless the same creature recasts the same spell on the same target within those minutes.
+      const key = `${tokenId}|${stat}|${hashOf(`${source.item}|${source.author}|${save.roll ?? `${save.die}|${save.value}`}`)}`;
+      const oldKey = `${tokenId}|${stat}|${save.die}|${save.value}`; // the key before 0.4.3, for saves recorded then
+      const has = (e, k) => e.src === k || e.alt?.includes(k);
+      const onCard = (e) => e.m === msg.id || e.ms?.includes(msg.id);
+      const known = (e) => e.k === "save" && ((has(e, key) && (onCard(e) || now() - (e.t ?? 0) < COPY_WINDOW)) || (!e.m && recent(e) && has(e, oldKey)));
+      if (Rec.seen.has(`${msg.id}|${key}`)) continue;
+      Rec.seen.add(`${msg.id}|${key}`);
+      const seenBefore = data.events.find(known);
+      if (seenBefore) {
+        // A copy on another card: that card is remembered too, so a later update of it matches at any age.
+        if (!onCard(seenBefore) && seenBefore.m) {
+          (seenBefore.ms ??= []).push(msg.id);
+          Store.scheduleSave(s.id);
+        }
+        continue;
+      }
       const o = degree(save.success);
       const nat = save.die ?? null;
       const slot = `${msg.id}|${tokenId}|${stat}`;
@@ -1121,13 +1204,13 @@ async function onUpdateChatMessage(msg, changes) {
       } else {
         // The card's speaker cast the spell or used the ability that forced the save.
         const caster = msg.actor && msg.actor.uuid !== tok.actor.uuid ? who(msg.actor, msg.token) : null;
-        await record({ k: "save", a: who(tok.actor, tok), s: stat, o, nat, src: key, ...(caster ? { by: caster } : {}) });
+        await record({ k: "save", a: who(tok.actor, tok), s: stat, o, nat, src: key, m: msg.id, ...(caster ? { by: caster } : {}) });
       }
     }
   }
 }
 
-async function onUpdateActor(actor, changes) {
+async function onUpdateActor(actor, changes, options = {}) {
   const prevHp = Rec.hp.get(actor.uuid);
   const prevRes = Rec.res.get(actor.uuid);
   const hp = hpSnap(actor);
@@ -1138,7 +1221,8 @@ async function onUpdateActor(actor, changes) {
   const w = who(actor);
   if (!w) return;
 
-  if (prevHp && hp && changes.system?.attributes?.hp) {
+  // An undo from a card's Revert button isn't healing or damage: the revert takes back what the card recorded.
+  if (prevHp && hp && changes.system?.attributes?.hp && !options.damageUndo) {
     // Only a change to HP itself counts. Temporary HP that went with it is part of the same hit (temp);
     // temporary HP cleared on its own (expired) isn't damage, and HP that rose with the maximum (a level,
     // a rest that raised it) isn't healing.
@@ -2179,7 +2263,7 @@ class LedgerApp extends foundry.applications.api.ApplicationV2 {
       ui.notifications.info(`Campaign Ledger: imported ${added} new session${added === 1 ? "" : "s"}, merged ${merged}.`);
     } catch (e) {
       console.error(MOD, e);
-      ui.notifications.error(`Campaign Ledger: couldn't import — ${e.message}.`);
+      ui.notifications.error(`Campaign Ledger: couldn't import (${e.message}).`);
     }
     this.render();
   }
@@ -2316,7 +2400,7 @@ Hooks.on("createChatMessage", (msg) => {
   onChatMessage(msg).catch((e) => console.error(MOD, e));
 });
 Hooks.on("updateChatMessage", (msg, changes) => onUpdateChatMessage(msg, changes).catch((e) => console.error(MOD, e)));
-Hooks.on("updateActor", (a, c) => onUpdateActor(a, c).catch((e) => console.error(MOD, e)));
+Hooks.on("updateActor", (a, c, o) => onUpdateActor(a, c, o).catch((e) => console.error(MOD, e)));
 Hooks.on("createItem", (i) => onDying(i).catch((e) => console.error(MOD, e)));
 Hooks.on("updateItem", (i, c) => onDying(i, c ?? {}).catch((e) => console.error(MOD, e)));
 Hooks.on("combatStart", (c) => onCombatStart(c).catch((e) => console.error(MOD, e)));

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3
+
+- The Revert button on PF2e's damage or healing card now takes back what the ledger recorded for that card: the damage or healing dealt and taken, and any kill, down or revive it caused. The undo itself is no longer counted as healing (or as damage).
+- A kill, down or revive from HP changed by hand goes to whoever last hit (or healed) that creature in the last minute, and a missed attack no longer counts as a hit. With no recent hit it goes to whoever's turn it is, but only when they're on the other side (the same side, for healing); otherwise it's left unattributed.
+- Saves rolled through PF2e Toolbelt's Target Helper: two different saves with the same die and total are no longer taken for one. A save Toolbelt copies onto the spell's damage card still counts once, also when that card changes again later.
+- A damage card that changed no HP (all absorbed by a shield, or only persistent damage added) no longer takes over the damage, kill or down of a card posted just before it on the same creature.
+- Clearer wording on the import error message.
+
 ## 0.4.2
 
 - The Arcs list says "1 session" instead of "1 sessions".
