@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0
+
+- The Campaign Ledger and Chat Archive windows remember their size and place, in each browser.
+- Restoring a window from minimized brings it back at its full size; on Foundry 14.370 it came back as a thin strip.
+- Verified on Foundry 14.370.
+
 ## 0.4.3
 
 - The Revert button on PF2e's damage or healing card now takes back what the ledger recorded for that card: the damage or healing dealt and taken, and any kill, down or revive it caused. The undo itself is no longer counted as healing (or as damage).

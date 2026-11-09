@@ -652,8 +652,150 @@ function archiveTarget() {
 
 const PAGE = 200;
 
+/* ------------------------------------------------------------------ */
+/* Window memory                                                      */
+/* ------------------------------------------------------------------ */
+
+/* The same code in each of Sir Bayard's modules. A window made with rememberWindow keeps the size and place the user
+ * gives it, in this browser, and comes back from minimized whole: Foundry's restore animation can stall at the title
+ * bar's height (seen on 14.370, core windows too) and Foundry sets the size while it runs, so a restored window came
+ * back as a strip. */
+
+/** Wait for an element's own transitions to end; a hidden tab pauses them, so after a second they're finished by hand. */
+async function settleWindow(el) {
+  const anims = el?.getAnimations?.() ?? [];
+  if (!anims.length) return;
+  await Promise.race([Promise.all(anims.map((a) => a.finished.catch(() => null))), new Promise((r) => setTimeout(r, 1200))]);
+  for (const a of el.getAnimations?.() ?? []) {
+    try {
+      a.finish();
+    } catch {
+      /* an animation that can't finish (infinite) is left alone */
+    }
+  }
+}
+
+/**
+ * Give an ApplicationV2 class window memory.
+ * @param {typeof ApplicationV2} Base
+ * @param {string} key          localStorage key for this window
+ * @param {object} [opts]
+ * @param {boolean|"width"} [opts.size] what to keep besides the place: true for width and height, "width" for a window
+ *   whose height fits its content, false for a window sized wholly by its content
+ */
+function rememberWindow(Base, key, { size = true } = {}) {
+  const MIN_W = 240, MIN_H = 120;
+  const load = () => {
+    let v;
+    try {
+      v = JSON.parse(globalThis.localStorage?.getItem(key) ?? "null");
+    } catch {
+      return {};
+    }
+    if (!v || typeof v !== "object") return {};
+    const W = globalThis.innerWidth ?? 1920, H = globalThis.innerHeight ?? 1080;
+    const out = {};
+    // A size saved while the window was collapsed is no size at all.
+    if (size === true && v.width >= MIN_W && v.height >= MIN_H) {
+      out.width = Math.min(v.width, W);
+      out.height = Math.min(v.height, H);
+    } else if (size === "width" && v.width >= MIN_W) out.width = Math.min(v.width, W);
+    const w = out.width ?? MIN_W, h = out.height ?? MIN_H;
+    if (Number.isFinite(v.left)) out.left = Math.max(0, Math.min(v.left, W - w));
+    if (Number.isFinite(v.top)) out.top = Math.max(0, Math.min(v.top, H - h));
+    return out;
+  };
+  let timer = null;
+  const save = (position) => {
+    // Copy now: Foundry hands over its own live position object, which may change before the save runs.
+    const pos = { left: position.left, top: position.top, width: position.width, height: position.height };
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      try {
+        const v = { left: pos.left, top: pos.top };
+        if (size) v.width = pos.width;
+        if (size === true) v.height = pos.height;
+        globalThis.localStorage?.setItem(key, JSON.stringify(v));
+      } catch {
+        /* no storage: the window opens where Foundry puts it */
+      }
+    }, 300);
+  };
+
+  return class extends Base {
+    #beforeMin = null;
+    #restoring = false;
+    #restore = null;
+
+    constructor(options = {}) {
+      super(foundry.utils.mergeObject({ position: load() }, options, { inplace: false }));
+    }
+
+    /** Restore a minimized window before drawing it: a draw that ends while it's collapsed takes the title bar's size. */
+    async render(options = {}, _options = {}) {
+      if ((this.minimized || this.#restore) && (options === true || options?.force)) {
+        const open = this.rendered;
+        await this.maximize();
+        // Closed while it was being restored: don't open it again.
+        if (open && !this.rendered) return this;
+      }
+      return super.render(options, _options);
+    }
+
+    async minimize() {
+      if (!this.minimized && this.rendered) {
+        const auto = this.options.position ?? {};
+        this.#beforeMin = {
+          width: auto.width === "auto" ? "auto" : this.position.width,
+          height: auto.height === "auto" ? "auto" : this.position.height,
+        };
+      }
+      return super.minimize();
+    }
+
+    maximize() {
+      // A restore already under way is the one to wait for.
+      if (this.#restore) return this.#restore;
+      if (!this.minimized) return super.maximize();
+      this.#restore = this.#restoreWhole().finally(() => (this.#restore = null));
+      return this.#restore;
+    }
+
+    async #restoreWhole() {
+      const was = this.#beforeMin;
+      this.#restoring = true;
+      try {
+        const pending = super.maximize();
+        for (const a of this.element?.getAnimations?.() ?? []) {
+          try {
+            a.finish();
+          } catch {
+            /* nothing to finish */
+          }
+        }
+        await pending;
+        await settleWindow(this.element);
+        // Not if it was closed or minimized again meanwhile.
+        if (was && this.rendered && !this.minimized) this.setPosition(was);
+      } finally {
+        this.#restoring = false;
+      }
+    }
+
+    /** Remember the size and place the user gives the window (not while it's minimized or being restored). */
+    _onPosition(position) {
+      super._onPosition?.(position);
+      if (!this.rendered || this.minimized || this.#restoring) return;
+      if (![position.left, position.top].every(Number.isFinite)) return;
+      if (size && !(position.width >= MIN_W)) return;
+      if (size === true && !(position.height >= MIN_H)) return;
+      save(position);
+    }
+  };
+}
+
 /** GM-only window: a session's archived chat, oldest first, with search and filters. */
-class ChatArchiveApp extends foundry.applications.api.ApplicationV2 {
+class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size.archive`) {
   static DEFAULT_OPTIONS = {
     id: "pcl-chat-archive",
     classes: ["pcl-app", "pcl-archive-app"],
@@ -1717,7 +1859,7 @@ const PARTY_COLUMNS = [
   { key: "rerolls", label: "Rerolls", group: "Dice", fmt: (a) => (a.rerolls ? `${a.rerollsBetter}/${a.rerolls}` : "–"), tip: "Rerolls that improved the result / all rerolls" },
 ];
 
-class LedgerApp extends foundry.applications.api.ApplicationV2 {
+class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size`) {
   static DEFAULT_OPTIONS = {
     id: "pf2e-campaign-ledger",
     classes: ["pcl-app"],

@@ -55,6 +55,8 @@ Records table statistics as you play and shows them in a dashboard window: attac
 
 Token controls on the left: the book icon at the bottom of the list. Also under Game Settings &gt; Configure Settings &gt; PF2e Campaign Ledger. Macro: `game.modules.get("pf2e-campaign-ledger").api.open()`
 
+The ledger and the chat archive remember their size and place, in each browser.
+
 ## Tabs
 
 - **Party**: Everyone side by side. Click a column to sort.
