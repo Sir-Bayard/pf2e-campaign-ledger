@@ -357,13 +357,11 @@ async function resumeSession() {
 /* ------------------------------------------------------------------ */
 /* Chat archive                                                       */
 /* ------------------------------------------------------------------ */
-// The chat log is copied into a file next to the session files, then (by default) cleared, so a long campaign doesn't
+// The chat log is copied into files next to the session files, then (by default) cleared, so a long campaign doesn't
 // slow Foundry down. Archives hold GM whispers and blind rolls, so the files get random names (players can fetch a
-// file by its URL but can't browse the folder), and the list of them lives on a GM-only journal entry ("Campaign
-// Ledger (GM data)") rather than in the index setting the ledger shows players. That keeps them out of the players'
-// view, not out of a determined player's console: Foundry sends every journal entry, compendium and setting to every
-// client (checked in Foundry 14), so this is the same protection GM journals and stat blocks have. Chat whispers are
-// the only thing the server itself withholds.
+// file by its URL but can't browse the folder) and are listed on a GM-only journal entry, not in the index setting
+// players read. That keeps them out of the players' view, not out of a determined player's console: Foundry sends
+// every journal entry, compendium and setting to every client (Foundry 14), the same protection GM journals have.
 
 /** The GM-only journal entry that records which archive files belong to which session. */
 function gmStore() {
@@ -378,7 +376,7 @@ async function ensureGmStore() {
   });
 }
 
-/** The archives of one session: [{ file, n, from, to, at }], oldest first (stored keyed by file, so writes merge). */
+/** A session's archives: [{ file, pub, n, nPub, from, to, at }], oldest first (keyed by file, so writes merge). */
 function archivesOf(sessionId) {
   const v = gmStore()?.flags?.[MOD]?.chat?.[sessionId] ?? {};
   return Object.values(foundry.utils.deepClone(v)).filter((a) => a?.file).sort((a, b) => a.from - b.from || a.at - b.at);
@@ -386,7 +384,6 @@ function archivesOf(sessionId) {
 
 const fileKey = (file) => file.replace(/^chat-/, "").replace(/\.json$/, "");
 
-/** One message as it looked in chat (rendered for the GM), with what the archive window filters on. */
 const UNKNOWN_NAME = "Unknown";
 
 /** Whether the players saw this message's speaker as nameless. */
@@ -400,6 +397,10 @@ function nameHidden(m) {
   return !!tok && tok.actor?.type !== "character" && tok.playersCanSeeName === false;
 }
 
+/**
+ * One message as rendered for the GM, with the players' copy of a public message (pubHtml, pubSpeaker) and the
+ * fields the archive window filters on.
+ */
 async function archiveRow(m) {
   let html, pubHtml = null, pubSpeaker = null;
   try {
@@ -496,8 +497,7 @@ async function archiveChat(sessionId, { clear = true } = {}) {
       rows.push(await archiveRow(msgs[i]));
       if (i % 25 === 0) try { bar?.update?.({ pct: (i / msgs.length) * 0.9 }); } catch (e) { /* ignore */ }
     }
-    // Each message goes with the session it was posted in: the last one started before it (a recap posted after a
-    // session ended stays with that session). Messages from before any session go with the one being archived.
+    // Messages from before any session go with the session being archived (see sessionAt).
     const groups = new Map();
     for (const r of rows) {
       const sid = sessionAt(r.t) ?? sessionId;
@@ -656,10 +656,12 @@ const PAGE = 200;
 /* Window memory                                                      */
 /* ------------------------------------------------------------------ */
 
-/* The same code in each of Sir Bayard's modules. A window made with rememberWindow keeps the size and place the user
- * gives it, in this browser, and comes back from minimized whole: Foundry's restore animation can stall at the title
- * bar's height (seen on 14.370, core windows too) and Foundry sets the size while it runs, so a restored window came
- * back as a strip. */
+/*
+ * Window memory, shared verbatim with the author's other modules (keep the copies in sync). A window made with
+ * rememberWindow keeps the size and place the user gives it, in this browser, and restores from minimized at full
+ * size: Foundry's restore animation can stall at the title bar's height (seen on Foundry 14.370, core windows too)
+ * and Foundry sets the size while it runs, which would leave the window a strip.
+ */
 
 /** Wait for an element's own transitions to end; a hidden tab pauses them, so after a second they're finished by hand. */
 async function settleWindow(el) {
@@ -903,7 +905,10 @@ async function exportChat(sessionId) {
   foundry.utils.saveDataToFile(out.md, "text/markdown", `${name}${date}-chat${gm ? "-gm" : ""}.md`);
 }
 
-/** GM-only window: a session's archived chat, oldest first, with search and filters. */
+/**
+ * A session's archived chat, oldest first, with search and filters. The GM reads the whole log; a player, the
+ * players' copy.
+ */
 class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size.archive`) {
   static DEFAULT_OPTIONS = {
     id: "pcl-chat-archive",
@@ -1135,9 +1140,9 @@ function heroReroll(w) {
 }
 
 /**
- * The spell or ability and the creature behind a Target Helper card, the same on a spell card and on the damage card
- * Toolbelt copies its saves to. Toolbelt leaves both empty on a spell card and, on the damage card, sets the item to
- * the spell's uuid (the card's spell, or a scroll's or wand's embedded spell) and leaves the author empty.
+ * The { item, author } uuids behind a Target Helper card, the same on a spell card and on the damage card Toolbelt
+ * copies its saves to. Toolbelt's flags can be empty (both on a spell card, the author on a damage card), so the
+ * card's spell (or a scroll's or wand's embedded spell) and its speaker fill in.
  */
 function saveSource(msg) {
   const th = msg.flags?.["pf2e-toolbelt"]?.targetHelper ?? {};
@@ -1349,11 +1354,10 @@ async function onDamageApplied(msg, flags) {
   let a = who(src);
   const tg = who(target, msg.token);
   const item = flags.origin?.uuid ? fromUuidSync(flags.origin.uuid) : null;
-  // Damage the creature did to itself (persistent damage, a backfiring ability) goes to whoever last hit it, if
-  // anyone did within the attribution window; otherwise it stays its own
+  // Damage the creature did to itself (persistent damage, a backfiring ability) goes to the persistent tick it just
+  // rolled (within 15 seconds), else to whoever last hit it; otherwise it stays its own.
   let pd = false;
   if (!heal && a.k === tg.k) {
-    // The persistent tick just rolled (same creature, moments ago) says who it belongs to; else the last hitter
     const tick = Rec.pdTick.get(target.uuid);
     const last = Rec.lastHit.get(target.uuid);
     const src = tick && now() - tick.t <= 15000 ? tick.by : last?.w;
@@ -1418,12 +1422,12 @@ async function onUpdateChatMessage(msg, changes) {
       const tok = scene?.tokens.get(tokenId);
       if (!tok?.actor) continue;
       const stat = save.statistic ?? v.statistic ?? null;
-      // Toolbelt copies the saves from a spell card onto its damage card. A copy is the same roll (Toolbelt keeps the
-      // roll's JSON) for the same spell or ability and author, seen on another card within a few minutes; on the same
-      // card it's the same save at any age. Two real saves that roll the same can't then be taken for one another
-      // unless the same creature recasts the same spell on the same target within those minutes.
+      // Toolbelt copies a spell card's saves onto its damage card. A copy is the same roll (Toolbelt keeps the roll's
+      // JSON) for the same source and author, seen on another card within COPY_WINDOW, or on the same card at any
+      // age. Two real saves are taken for one only if the same creature recasts the same spell on the same target
+      // within that window.
       const key = `${tokenId}|${stat}|${hashOf(`${source.item}|${source.author}|${save.roll ?? `${save.die}|${save.value}`}`)}`;
-      const oldKey = `${tokenId}|${stat}|${save.die}|${save.value}`; // the key before 0.4.3, for saves recorded then
+      const oldKey = `${tokenId}|${stat}|${save.die}|${save.value}`; // the older key format, for saves recorded with it
       const has = (e, k) => e.src === k || e.alt?.includes(k);
       const onCard = (e) => e.m === msg.id || e.ms?.includes(msg.id);
       const known = (e) => e.k === "save" && ((has(e, key) && (onCard(e) || now() - (e.t ?? 0) < COPY_WINDOW)) || (!e.m && recent(e) && has(e, oldKey)));
@@ -1502,8 +1506,8 @@ async function onUpdateActor(actor, changes, options = {}) {
 
   if (prevRes && w.p) {
     if (prevRes.hero !== null && res.hero !== null && res.hero < prevRes.hero) {
-      // Hero Points are spent one at a time on a reroll (PF2e takes the point, then posts the reroll), or all
-      // at once to stabilise while dying. Any other decrease is a reset, recorded as lost and not counted.
+      // Hero Points are spent one at a time on a reroll (PF2e takes the point, then posts the reroll), or all at once
+      // to stabilize while dying. Any other decrease is a reset, recorded as lost and not counted.
       const n = prevRes.hero - res.hero;
       const last = Rec.lastReroll.get(w.k);
       const dying = actor.itemTypes?.condition?.some((c) => c.slug === "dying");
@@ -2068,7 +2072,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     if (nl) nl.scrollTop = pos.log;
   }
 
-  /** A live refresh: only when the data moved on, and not under a field the GM is typing in. */
+  /** A live refresh: only when the data moved on, and not under a field the user is typing in. */
   refresh() {
     if (!this.rendered || this.rev === Store.rev) return;
     const focus = document.activeElement;
