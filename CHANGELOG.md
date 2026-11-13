@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0
+
+- Export a session's archived chat as Markdown: the button at the top of the Chat Archive window saves who spoke and when, what they wrote, and each roll's name, total and result, oldest first. The GM chooses the players' copy or the GM copy (whispers and DCs included); players get their copy.
+
 ## 1.0.0
 
 - The Campaign Ledger and Chat Archive windows remember their size and place, in each browser.

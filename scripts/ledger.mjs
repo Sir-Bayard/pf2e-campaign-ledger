@@ -794,6 +794,115 @@ function rememberWindow(Base, key, { size = true } = {}) {
   };
 }
 
+/** Text of an archived message's HTML, with block elements on their own lines. */
+function plainText(node) {
+  const BLOCK = /^(P|DIV|LI|BR|HR|H[1-6]|SECTION|HEADER|FOOTER|OL|UL|TABLE|TR|BLOCKQUOTE)$/;
+  let out = "";
+  const walk = (n) => {
+    if (n.nodeType === 3) out += n.nodeValue.replace(/\s+/g, " ");
+    else if (n.nodeType === 1) {
+      const block = BLOCK.test(n.tagName);
+      if (block) out += "\n";
+      for (const c of n.childNodes) walk(c);
+      if (block) out += "\n";
+    }
+  };
+  walk(node);
+  return out.split("\n").map((l) => l.trim()).filter(Boolean).join("\n");
+}
+
+/** Text made safe for Markdown: inline marks and a leading heading, quote or list marker are escaped. */
+const mdEscape = (t) => String(t ?? "").replace(/([\\`*_[\]<>|~])/g, "\\$1").replace(/^(\s*)(#|>|[-+]|\d+[.)])(?=\s|$)/, "$1\\$2");
+
+/**
+ * One archived message as Markdown: who spoke and when, then a roll's title, total and result, an item card's
+ * name, or the message's text. `gm` keeps whispers and DCs (only in the GM's copy). `day` is the session's date:
+ * a message from another day shows its date too. Null for a message with nothing to show.
+ */
+function messageMarkdown(m, { gm, day }) {
+  const doc = new DOMParser().parseFromString(m.html ?? "", "text/html");
+  const el = doc.querySelector(".chat-message") ?? doc.body;
+  const q = (sel) => el.querySelector(sel);
+  const txt = (x) => (x ? plainText(x).replace(/\n/g, " ") : "");
+  const at = new Date(m.t);
+  const time = at.toLocaleDateString() === day
+    ? at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : at.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const who = m.speaker || m.author || "Unknown";
+  const tags = [m.author && m.author !== who ? m.author : "", time];
+  if (gm && m.whisper?.length) tags.push(`whisper to ${m.whisper.join(", ")}`);
+  if (gm && m.blind) tags.push("blind");
+  const head = `**${mdEscape(who)}** (${mdEscape(tags.filter(Boolean).join(", "))})`;
+  const content = q(".message-content");
+  const lines = [];
+  const totals = [...el.querySelectorAll(".dice-total")].map((x) => x.textContent.trim()).filter(Boolean);
+  if (totals.length) {
+    const title = txt(q(".flavor-text h4.action")) || txt(q(".flavor-text strong")) || txt(q(".flavor-text")) || "Roll";
+    // PF2e marks the result adjusted and unadjusted only when something changed it.
+    const dos = q(".degree-of-success");
+    const degree = txt(dos?.querySelector(".adjusted")) || txt(dos?.querySelector(".unadjusted")) || txt(dos).replace(/^Result:\s*/i, "");
+    const dc = gm ? txt(q(".target-dc")) : "";
+    lines.push(`${mdEscape(title)}: **${mdEscape(totals.join(", "))}**${degree ? `, ${mdEscape(degree)}` : ""}${dc ? ` (${mdEscape(dc)})` : ""}`);
+    content?.querySelectorAll(".dice-roll, button, .card-buttons, .damage-application").forEach((x) => x.remove());
+  } else {
+    const card = content?.querySelector(".item-card, .chat-card");
+    const flavor = txt(q(".flavor-text"));
+    if (card) lines.push(`*${mdEscape(txt(card.querySelector("header h3, .card-header h3, h3")) || flavor || "Item")}*`);
+    else if (flavor) lines.push(`*${mdEscape(flavor)}*`);
+  }
+  if (content && !content.querySelector(".item-card, .chat-card")) {
+    const body = plainText(content);
+    if (body) lines.push(...body.split("\n").map(mdEscape));
+  }
+  return lines.length ? [head, ...lines].join("  \n") : null;
+}
+
+/** A session's archived chat as one Markdown file: the GM's copy, or the players' copy. { md, missing } or null. */
+async function chatMarkdown(sessionId, { gm }) {
+  const s = Store.index.sessions.find((x) => x.id === sessionId);
+  const list = gm ? archivesOf(sessionId) : publicArchivesOf(sessionId);
+  const rows = [];
+  let missing = 0;
+  for (const a of list) {
+    const data = await fetch(`${fileDir()}/${a.file}?t=${now()}`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    if (data?.messages) rows.push(...data.messages);
+    else missing++;
+  }
+  if (!rows.length) return null;
+  rows.sort((x, y) => x.t - y.t);
+  const day = new Date(s?.start ?? rows[0].t).toLocaleDateString();
+  const title = `${mdEscape(s?.name ?? "Session")}: chat${gm ? " (GM copy)" : ""}`;
+  const note = missing ? `*${missing} archive file${missing === 1 ? " couldn't" : "s couldn't"} be read; this is part of the chat.*\n\n` : "";
+  const body = rows.map((m) => messageMarkdown(m, { gm, day })).filter(Boolean).join("\n\n");
+  return { md: `# ${title}\n\n${s?.start ? `${fmtDate(s.start)}\n\n` : ""}${note}${body}\n`, missing };
+}
+
+/** Download a session's archived chat as Markdown. The GM picks the players' copy or the GM's; players get theirs. */
+async function exportChat(sessionId) {
+  let gm = false;
+  if (game.user.isGM) {
+    const pick = await foundry.applications.api.DialogV2.wait({
+      window: { title: "Export the chat" },
+      content: `<label class="pcl-check"><input type="radio" name="copy" value="pub" checked> Players' copy: what the table saw</label>
+        <label class="pcl-check"><input type="radio" name="copy" value="gm"> GM copy: everything, whispers and DCs included</label>`,
+      buttons: [
+        { action: "export", label: "Export", icon: "fa-solid fa-file-export", default: true, callback: (ev, button) => button.form.elements.copy.value },
+        { action: "cancel", label: "Cancel" },
+      ],
+      rejectClose: false,
+    });
+    if (pick !== "pub" && pick !== "gm") return;
+    gm = pick === "gm";
+  }
+  const out = await chatMarkdown(sessionId, { gm });
+  if (!out) return ui.notifications.warn(`Campaign Ledger: there's no ${gm ? "" : "players' "}archived chat for that session.`);
+  if (out.missing) ui.notifications.warn(`Campaign Ledger: ${out.missing} archive file${out.missing === 1 ? " is" : "s are"} missing, so the export is only part of the chat.`);
+  const s = Store.index.sessions.find((x) => x.id === sessionId);
+  const name = (s?.name ?? "session").replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "").toLowerCase() || "session";
+  const date = s?.start ? `-${new Date(s.start).toISOString().slice(0, 10)}` : "";
+  foundry.utils.saveDataToFile(out.md, "text/markdown", `${name}${date}-chat${gm ? "-gm" : ""}.md`);
+}
+
 /** GM-only window: a session's archived chat, oldest first, with search and filters. */
 class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size.archive`) {
   static DEFAULT_OPTIONS = {
@@ -802,7 +911,7 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
     tag: "div",
     window: { title: "Chat Archive", icon: "fa-solid fa-comments", resizable: true },
     position: { width: 520, height: 760 },
-    actions: { pclMore: ChatArchiveApp.#onMore },
+    actions: { pclMore: ChatArchiveApp.#onMore, pclExportChat: ChatArchiveApp.#onExportChat },
   };
 
   static open(sessionId) {
@@ -867,6 +976,7 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
         <label><input type="checkbox" name="rolls"${s.rolls ? " checked" : ""}> Rolls only</label>
         ${gm ? `<label><input type="checkbox" name="whispers"${s.whispers ? " checked" : ""}> Whispers</label>` : ""}
         <span class="pcl-archive-count">${shown.length} of ${rows.length}${this.missing ? ` · ${this.missing} archive file${this.missing === 1 ? "" : "s"} missing` : ""}</span>
+        <button type="button" class="pcl-archive-export" data-action="pclExportChat" data-tooltip="Export this session's chat as Markdown"><i class="fa-solid fa-file-export"></i></button>
       </header>
       <section class="pcl-body"><ol class="chat-log pcl-archive-log">${shown.slice(0, s.shown).map((m) => clean(m.html)).join("")}</ol>
       ${shown.length > s.shown ? `<button type="button" class="pcl-more" data-action="pclMore">Show ${Math.min(PAGE, shown.length - s.shown)} more</button>` : ""}</section>`;
@@ -896,6 +1006,10 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
         box?.setSelectionRange(box.value.length, box.value.length);
       }, 300);
     });
+  }
+
+  static #onExportChat() {
+    if (this.state.sid) exportChat(this.state.sid);
   }
 
   static #onMore() {

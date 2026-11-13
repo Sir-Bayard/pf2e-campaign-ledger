@@ -81,6 +81,8 @@ A long chat log slows Foundry down. "End session" offers to archive the chat wit
 
 The speech bubbles on the Sessions tab open a session's archived chat: search, a speaker filter, rolls only, and for the GM whispers on or off. Each archive is two files. The GM's copy has every message, whispers and blind rolls included, with what the GM saw (DCs, modifiers). The players' copy has only the messages everyone saw, as the players saw them: PF2e's GM-only parts (DCs, modifiers, roll formulas) are taken out, and a speaker whose name the players couldn't see shows as "Unknown". Players read their copy when they can open the ledger and "Players can read the archived chat" is on.
 
+**Export.** The export button at the top of the archive window saves the session's chat as a Markdown file (`.md`), oldest first: who spoke and when, what they wrote, and each roll's name, total and result. The GM picks the players' copy (what the table saw) or the GM copy (whispers and DCs included); players get their copy. It's meant to go beside a session recap.
+
 The GM's copy is kept out of the players' view (a random file name, listed on a GM-only journal entry, "Campaign Ledger (GM data)"; don't delete it), but like GM journals and stat blocks it isn't out of reach of a player who digs in the browser console. Foundry sends every journal, compendium and setting to every client; chat whispers are the only thing the server itself withholds.
 
 If that journal entry is ever deleted, `game.modules.get("pf2e-campaign-ledger").api.rebuildChatIndex()` lists the archive files again. If the players' list loses an archive (after an Import, say), it is put back the next time the GM loads the world.
