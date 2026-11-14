@@ -83,7 +83,7 @@ The speech bubbles on the Sessions tab open a session's archived chat: search, a
 
 **Export.** The export button at the top of the archive window saves the session's chat as a Markdown file (`.md`), oldest first: who spoke and when, what they wrote, and each roll's name, total and result. The GM picks the players' copy (what the table saw) or the GM copy (whispers and DCs included); players get their copy. It's meant to go beside a session recap.
 
-The GM's copy is kept out of the players' view (a random file name, listed on a GM-only journal entry, "Campaign Ledger (GM data)"; don't delete it), but like GM journals and stat blocks it isn't out of reach of a player who digs in the browser console. Foundry sends every journal, compendium and setting to every client; chat whispers are the only thing the server itself withholds.
+The GM's copy is kept out of the players' view (a random file name, listed on a GM-only journal entry, "Campaign Ledger (GM data)"; don't delete it), but like GM journals and stat blocks it isn't out of reach of a player who digs in the browser console. Foundry sends every journal, compendium and setting to every client, and whispers are no safer: a player's client was seen holding the full text of whispered chat cards. Treat whispers like GM journals.
 
 If that journal entry is ever deleted, `game.modules.get("pf2e-campaign-ledger").api.rebuildChatIndex()` lists the archive files again. If the players' list loses an archive (after an Import, say), it is put back the next time the GM loads the world.
 
@@ -97,7 +97,9 @@ An encounter is recorded when you begin combat in the tracker and closes when yo
 
 ## Players
 
-Players get a read-only view: party tables, characters, encounters, dice and sessions. Enemy rows, enemy lines in the round log and enemy dice are GM-only. Turn the player view off with the "Players can open the ledger" setting.
+Players get a read-only view: party tables, characters, encounters, dice and sessions. Enemy rows, enemy lines in the round log and enemy dice are left out of their view. Turn the player view off with the "Players can open the ledger" setting.
+
+That keeps enemy numbers off the players' screens, not out of their reach: the session files (in `worlds/<world>/pf2e-campaign-ledger/`) hold every event, enemies included, and a player who digs in the browser can fetch them, even with the player view off.
 
 ## Reset, export and import
 
