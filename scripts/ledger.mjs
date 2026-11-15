@@ -9,7 +9,8 @@
  */
 
 import { gmTabs } from "./kit/gm-tabs.mjs";
-import { esc, safe } from "./kit/safe-text.mjs";
+import { esc, safe, tipAttr, labelAttr } from "./kit/safe-text.mjs";
+import { keyboardWindow } from "./kit/keyboard.mjs";
 import { singleWindow } from "./kit/single-window.mjs";
 import { rememberWindow } from "./kit/window-memory.mjs";
 
@@ -33,15 +34,19 @@ let leading = false;
  * True in the one client that records: the active GM's lead tab (a second tab of the same GM records nothing). A tab
  * that has just taken the lead drops what it had read, since the tab that led before wrote the files since.
  */
+let taking = null;
 async function isRecorder() {
   const lead = await tabs.leadNow();
   if (!lead && leading) await loseLead();
-  const took = lead && !leading;
-  leading = lead;
-  if (took) {
-    Store.cache.clear();
-    await resumeEncounter();
+  if (lead && !leading) {
+    leading = true;
+    // Every hook waits for the take-over, so they still run in the order they came
+    taking = (async () => {
+      Store.cache.clear();
+      await resumeEncounter();
+    })().finally(() => (taking = null));
   }
+  if (lead && taking) await taking;
   return lead;
 }
 
@@ -54,6 +59,7 @@ async function loseLead() {
   if (!leading) return;
   leading = false;
   clearTimeout(Store.timer);
+  Store.timer = null;
   Store.firstPending = 0;
   const ids = [...Store.cache.keys()];
   try {
@@ -145,6 +151,18 @@ function who(actor, tokenDoc = null) {
   return { k: `n:${name}`, n: name, p: actor.alliance === "party" };
 }
 
+/**
+ * A party row that isn't a player character (an actor of type "character"): a companion, familiar or summon, or an
+ * NPC fighting on the party's side. Still counted with the party; shown in a group of its own. Worked out when shown, so older sessions
+ * group the same way.
+ */
+function isAlly(row) {
+  if (!row?.p) return false;
+  if (!String(row.k).startsWith("a:")) return true;
+  const actor = game.actors.get(row.k.slice(2));
+  return !!actor && actor.type !== "character";
+}
+
 /** A persistent-damage roll: PF2e rolls it from the condition, with the creature itself as origin. */
 function isPersistent(msg, flags) {
   const ctx = flags?.context ?? {};
@@ -195,6 +213,21 @@ function mergeInto(data, disk, dropped = null) {
   for (const enc of disk.encounters) if (enc?.id && !data.encounters.some((x) => x.id === enc.id)) data.encounters.push(enc);
 }
 
+const SAVE_EVERY = 30 * 1000;
+
+/**
+ * Tell the other clients that session files changed, so players (and the GM's other tabs) read them again. A socket
+ * message rather than a write to the index setting, which every client would store.
+ */
+function announceSaved(ids) {
+  if (!ids.length) return;
+  try {
+    game.socket.emit(`module.${MOD}`, { type: "saved", ids });
+  } catch (e) {
+    console.warn(MOD, e);
+  }
+}
+
 const DEFAULT_INDEX = { version: 1, arcs: [], sessions: [], active: null, currentArc: null, updated: 0 };
 /** Returned by a mutateIndex change that turns out to have nothing to write. */
 const SKIP = Symbol("skip");
@@ -203,6 +236,7 @@ const Store = {
   cache: new Map(),
   timer: null,
   dirReady: false,
+  fixes: 0, // bumped when events change in place (a correction), so the Sessions tab's summaries are worked out again
   rev: 0, // bumped whenever the data the dashboard shows may have changed; open windows re-render only when it moved
 
   get index() {
@@ -269,7 +303,10 @@ const Store = {
       try {
         disk = await this.readFile(id);
       } catch (e) {
-        if (!this.readFailed++) ui.notifications.error(safe`Campaign Ledger: couldn't read the session file (${e.message}). Nothing is recorded until it can be read, so the file isn't overwritten.`, { permanent: true });
+        const running = id === game.settings.get(MOD, "index")?.active;
+        if (running && !this.readFailed++ && game.user.isGM) ui.notifications.error(safe`Campaign Ledger: couldn't read the session file (${e.message}). Nothing is recorded until it can be read, so the file isn't overwritten.`, { permanent: true });
+        else if (!running && game.user.isGM) ui.notifications.warn(safe`Campaign Ledger: couldn't read the file of an earlier session (${e.message}). The ledger leaves it out.`);
+        else console.warn(MOD, `couldn't read session ${id}`, e);
         throw new Error(`Campaign Ledger: couldn't read session ${id} (${e.message})`);
       }
       this.readFailed = 0;
@@ -319,7 +356,19 @@ const Store = {
    * copy was read (a hand-over between tabs) is kept: events and encounters this copy lacks are added from the file,
    * except events taken back here. Returns true when saved.
    */
-  async save(id, { force = false } = {}) {
+  // Saves of the same session run one after another, so an older copy never lands after a newer one
+  saving: new Map(),
+  save(id, opts = {}) {
+    const run = (this.saving.get(id) ?? Promise.resolve()).then(() => this.saveOnce(id, opts));
+    const tail = run.catch(() => {});
+    this.saving.set(id, tail);
+    tail.then(() => {
+      if (this.saving.get(id) === tail) this.saving.delete(id);
+    });
+    return run;
+  },
+
+  async saveOnce(id, { force = false } = {}) {
     const data = this.cache.get(id);
     if (!data) return false;
     if (!force && id === this.index.active && !tabs.isLead()) return false;
@@ -349,26 +398,37 @@ const Store = {
     return ok;
   },
 
-  // Save 4 seconds after the last event, but never wait more than 20 seconds during a busy fight.
+  /**
+   * Save 30 seconds after the first unsaved event, and at once at the end of a round, when combat ends and when the
+   * session ends (saveSoon, flushNow): a crash loses at most half a minute, and a long evening isn't uploaded whole
+   * every few seconds.
+   */
   firstPending: 0,
   scheduleSave(id) {
     this.dirty.add(id);
-    clearTimeout(this.timer);
     this.firstPending ||= now();
-    const wait = Math.max(0, Math.min(4000, this.firstPending + 20000 - now()));
-    this.timer = setTimeout(async () => {
-      this.firstPending = 0;
-      // Another tab took over meanwhile (or this one was frozen): hand over instead
-      if (leading && !tabs.isLead()) return loseLead();
-      for (const d of [...this.dirty]) await this.save(d);
-      await this.mutateIndex(() => null);
-    }, wait);
+    if (this.timer) return;
+    this.timer = setTimeout(() => this.saveSoon().catch((e) => console.error(MOD, e)), Math.max(0, this.firstPending + SAVE_EVERY - now()));
+  },
+
+  async saveSoon() {
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.firstPending = 0;
+    // Another tab took over meanwhile (or this one was frozen): hand over instead
+    if (leading && !tabs.isLead()) return loseLead();
+    const saved = [];
+    for (const d of [...this.dirty]) if (await this.save(d)) saved.push(d);
+    announceSaved(saved);
   },
 
   async flushNow() {
     clearTimeout(this.timer);
+    this.timer = null;
     this.firstPending = 0;
-    for (const id of [...this.dirty]) if (this.cache.has(id)) await this.save(id);
+    const saved = [];
+    for (const id of [...this.dirty]) if (this.cache.has(id) && (await this.save(id))) saved.push(id);
+    announceSaved(saved);
   },
 
   async loadScope(scope) {
@@ -393,14 +453,16 @@ const Store = {
 let starting = null;
 let expiring = null;
 
-async function activeSession({ create = true } = {}) {
+async function activeSession({ create = true, force = false } = {}) {
   const ix = Store.index;
   const s = ix.sessions.find((s) => s.id === ix.active);
   if (s && create) {
     expiring ??= expireStale(s).finally(() => (expiring = null));
-    if (await expiring) return activeSession({ create });
+    if (await expiring) return activeSession({ create, force });
   }
   if (s || !create) return s ?? null;
+  // The GM rolling on their own (prep between sessions) doesn't start one, unless asked to
+  if (!force && game.settings.get(MOD, "needPlayer") && !game.users.some((u) => u.active && !u.isGM)) return null;
   if (starting) return starting;
   starting = (async () => {
     let running = null;
@@ -444,9 +506,11 @@ async function expireStale(s) {
   const data = await Store.load(s.id);
   const last = data.events.at(-1)?.t ?? s.start;
   if (now() - last < gap) return false;
-  await endSession({ quiet: true, at: last });
-  ui.notifications.info(safe`Campaign Ledger: ${s.name} was still running from ${fmtDate(last)}; it has been ended and a new session starts now.`);
-  await whisperGM(`<h3><i class="fa-solid fa-circle-stop"></i> Ended ${esc(s.name)}</h3><p>It was still running from ${esc(fmtDate(last))}, so it has been ended as of its last event and a new session starts with this one. If that evening isn't over yet, use "Resume last session" in the ledger.</p>`, { notice: "expired", session: s.id });
+  await endSession({ quiet: true, at: last, auto: true });
+  // With no player logged in, the GM's roll ends the old session but starts no new one (needPlayer)
+  const next = !(game.settings.get(MOD, "needPlayer") && !game.users.some((u) => u.active && !u.isGM));
+  ui.notifications.info(safe`Campaign Ledger: ${s.name} was still running from ${fmtDate(last)}; it has been ended${next ? " and a new session starts now" : ""}.`);
+  await whisperGM(`<h3><i class="fa-solid fa-circle-stop"></i> Ended ${esc(s.name)}</h3><p>It was still running from ${esc(fmtDate(last))}, so it has been ended as of its last event${next ? " and a new session starts with this one" : ""}. If that evening isn't over yet, use "Resume last session" in the ledger.</p>`, { notice: "expired", session: s.id });
   return true;
 }
 
@@ -480,10 +544,10 @@ async function startSession() {
   await Store.mutateIndex((ix) => {
     ix.active = null;
   });
-  return activeSession();
+  return activeSession({ force: true });
 }
 
-async function endSession({ quiet = false, at = null, archive = false } = {}) {
+async function endSession({ quiet = false, at = null, archive = false, auto = false } = {}) {
   await Store.flushNow();
   const s = await Store.mutateIndex((ix) => {
     const run = ix.sessions.find((x) => x.id === ix.active);
@@ -498,7 +562,7 @@ async function endSession({ quiet = false, at = null, archive = false } = {}) {
   if (!quiet) ui.notifications.info(safe`Campaign Ledger: ended ${s.name}.`);
   // Archived (and cleared) before the recap, so the recap is the first thing in the fresh chat
   if (archive) await archiveChat(s.id, { clear: true });
-  if (game.settings.get(MOD, "recap") !== "off") await postRecap(s.id);
+  if (auto || game.settings.get(MOD, "recap") !== "off") await postRecap(s.id, { auto });
 }
 
 /** Reopens the most recently ended session as the active one (for an evening that was ended too soon). */
@@ -543,6 +607,28 @@ async function ensureGmStore() {
 function archivesOf(sessionId) {
   const v = gmStore()?.flags?.[MOD]?.chat?.[sessionId] ?? {};
   return Object.values(foundry.utils.deepClone(v)).filter((a) => a?.file).sort((a, b) => a.from - b.from || a.at - b.at);
+}
+
+/**
+ * Sessions no longer in the ledger (deleted, or a reset) whose archived chat is still listed, for the GM's archive
+ * window: [{ id, name, start }], newest first.
+ */
+function deletedWithChat() {
+  const ix = Store.index;
+  const chat = gmStore()?.flags?.[MOD]?.chat ?? {};
+  return Object.keys(chat)
+    .filter((sid) => !ix.sessions.some((s) => s.id === sid))
+    .map((sid) => ({ sid, list: archivesOf(sid) }))
+    .filter((x) => x.list.length)
+    .map((x) => ({ id: x.sid, name: "Deleted session", start: x.list[0].from, deleted: true }))
+    .sort((a, b) => b.start - a.start);
+}
+
+/** Take a session's archived chat off the GM's list (the files stay on the server). */
+async function forgetArchives(sessionId) {
+  const j = gmStore();
+  if (!j?.flags?.[MOD]?.chat?.[sessionId]) return;
+  await j.update({ [`flags.${MOD}.chat.${sessionId}`]: new foundry.data.operators.ForcedDeletion() });
 }
 
 const fileKey = (file) => file.replace(/^chat-/, "").replace(/\.json$/, "");
@@ -928,7 +1014,7 @@ async function exportChat(sessionId) {
  * A session's archived chat, oldest first, with search and filters. The GM reads the whole log; a player, the
  * players' copy.
  */
-class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "archive", from: `${MOD}.size.archive` }) {
+class ChatArchiveApp extends keyboardWindow(rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "archive", from: `${MOD}.size.archive` }), { module: MOD, scope: ".pcl-app", ownKeys: true }) {
   static DEFAULT_OPTIONS = {
     id: "pcl-chat-archive",
     classes: ["pcl-app", "pcl-archive-app"],
@@ -980,6 +1066,8 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
     const ix = Store.index;
     this.sig = ChatArchiveApp.signature();
     const withChat = [...ix.sessions].reverse().filter((s) => (gm ? archivesOf(s.id).length : s.chat?.length));
+    const deleted = gm ? deletedWithChat() : [];
+    withChat.push(...deleted);
     if (!this.state.sid || !withChat.some((s) => s.id === this.state.sid)) this.state.sid = withChat[0]?.id ?? null;
     if (!this.state.sid) {
       el.innerHTML = `<section class="pcl-body"><p class="pcl-empty">${gm ? `No chat has been archived yet. End a session with "Archive the chat" ticked, or use Archive chat in the ledger.` : "No chat has been archived yet."}</p></section>`;
@@ -994,13 +1082,13 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
     const clean = (h) => foundry.utils.cleanHTML(h);
     const opt = (v, label, sel) => `<option value="${esc(v)}"${sel ? " selected" : ""}>${esc(label)}</option>`;
     el.innerHTML = `<header class="pcl-head pcl-archive-head">
-        <select name="sid">${withChat.map((x) => opt(x.id, `${x.name} · ${fmtDate(x.start)}`, x.id === s.sid)).join("")}</select>
-        <input type="search" name="q" value="${esc(s.q)}" placeholder="Search">
-        <select name="who">${opt("", "Everyone", !s.who)}${speakers.map((n) => opt(n, n, n === s.who)).join("")}</select>
+        <select name="sid" aria-label="Session">${withChat.filter((x) => !x.deleted).map((x) => opt(x.id, `${x.name} · ${fmtDate(x.start)}`, x.id === s.sid)).join("")}${deleted.length ? `<optgroup label="Deleted sessions">${deleted.map((x) => opt(x.id, `${x.name} · ${fmtDate(x.start)}`, x.id === s.sid)).join("")}</optgroup>` : ""}</select>
+        <input type="search" name="q" value="${esc(s.q)}" placeholder="Search" aria-label="Search">
+        <select name="who" aria-label="Speaker">${opt("", "Everyone", !s.who)}${speakers.map((n) => opt(n, n, n === s.who)).join("")}</select>
         <label><input type="checkbox" name="rolls"${s.rolls ? " checked" : ""}> Rolls only</label>
         ${gm ? `<label><input type="checkbox" name="whispers"${s.whispers ? " checked" : ""}> Whispers</label>` : ""}
         <span class="pcl-archive-count">${shown.length} of ${rows.length}${this.missing ? ` · ${this.missing} archive file${this.missing === 1 ? "" : "s"} missing` : ""}</span>
-        <button type="button" class="pcl-archive-export" data-action="pclExportChat" data-tooltip-text="Export this session's chat as Markdown"><i class="fa-solid fa-file-export"></i></button>
+        <button type="button" class="pcl-archive-export" data-action="pclExportChat"${labelAttr("Export this session's chat as Markdown")}><i class="fa-solid fa-file-export" aria-hidden="true"></i></button>
       </header>
       <section class="pcl-body"><ol class="chat-log pcl-archive-log">${shown.slice(0, s.shown).map((m) => clean(m.html)).join("")}</ol>
       ${shown.length > s.shown ? `<button type="button" class="pcl-more" data-action="pclMore">Show ${Math.min(PAGE, shown.length - s.shown)} more</button>` : ""}</section>`;
@@ -1045,7 +1133,7 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
   /** What this window lists: who may read, and which files each session has. */
   static signature() {
     const gm = game.user.isGM;
-    return JSON.stringify([canReadChat(), Store.index.sessions.map((s) => [s.id, s.name, (gm ? archivesOf(s.id) : s.chat ?? []).map((a) => a.file)])]);
+    return JSON.stringify([canReadChat(), Store.index.sessions.map((s) => [s.id, s.name, (gm ? archivesOf(s.id) : s.chat ?? []).map((a) => a.file)]), gm ? deletedWithChat().map((d) => d.id) : []]);
   }
 
   /** Another archive was made, or access changed: read the files again, keeping the place in the list. */
@@ -1178,6 +1266,7 @@ const Rec = {
 async function record(evt) {
   if (!recording() || !(await isRecorder())) return null;
   const s = await activeSession();
+  if (!s) return null;
   const data = await Store.load(s.id);
   evt.id ??= foundry.utils.randomID(8);
   evt.t ??= now();
@@ -1423,10 +1512,7 @@ async function onDamageApplied(msg, flags) {
   if (!applied.isHealing && (hpPath || recent || (target.system?.attributes?.hp?.value ?? 1) <= 0)) Rec.lastCard.set(target.uuid, { m: msg.id, t: now() });
   if (!src) {
     // No source on the card: nothing to credit, but what it changed is still the card's, for its Revert button.
-    if (!recent) return;
-    for (const ev of recent.evs) ev.m ??= msg.id;
-    const s = await activeSession({ create: false });
-    if (s) Store.scheduleSave(s.id);
+    if (recent) claimRecent(recent, { m: msg.id, a: null, heal: !!applied.isHealing });
     return;
   }
   const amt = (applied.updates ?? [])
@@ -1443,20 +1529,35 @@ async function onDamageApplied(msg, flags) {
     const tick = Rec.pdTick.get(target.uuid);
     const last = Rec.lastHit.get(target.uuid);
     const src = tick && now() - tick.t <= 15000 ? tick.by : last && now() - last.t < ATTRIBUTION_WINDOW ? last.w : null;
-    if (src && src.k !== a.k) { a = src; pd = true; }
+    // With nobody to credit it's unattributed, not the creature's own damage dealt (or friendly fire)
+    if (src && src.k !== a.k) {
+      a = src;
+      pd = true;
+    } else a = null;
   }
-  // Each event this card accounts for carries its message id (m), so the card's Revert button can take them back.
+  // Each event this card accounts for carries its message id (m), so the card's Revert button can take them back. The
+  // claim comes first: the HP change's own events may still be on their way.
+  if (recent) claimRecent(recent, { m: msg.id, a, heal });
   if (amt > 0) await record({ k: heal ? "healdone" : "dealt", a, tg, amt, it: pd ? "persistent damage" : (item?.name ?? null), ...(pd ? { pd: true } : {}), m: msg.id });
+}
 
-  if (!recent) return;
-  for (const ev of recent.evs) {
-    ev.m ??= msg.id;
-    if (!heal && (ev.k === "taken" || ev.k === "down")) ev.by = a;
-    if (!heal && ev.k === "kill") ev.a = a;
-    if (heal && (ev.k === "healed" || ev.k === "up")) ev.by = a;
-  }
-  const s = await activeSession({ create: false });
-  if (s) Store.scheduleSave(s.id);
+/**
+ * A card's claim on an HP change recorded a moment before it: its id on each event (for its Revert), and the real
+ * attacker or healer. Events of that change still being recorded take the claim as they arrive (see onUpdateActor).
+ */
+function claimRecent(recent, claim) {
+  recent.claim = claim;
+  for (const ev of recent.evs) claimEvent(claim, ev);
+  const s = Store.index.active;
+  if (s) Store.scheduleSave(s);
+}
+
+function claimEvent(claim, ev) {
+  ev.m ??= claim.m;
+  if (!claim.a) return;
+  if (!claim.heal && (ev.k === "taken" || ev.k === "down")) ev.by = claim.a;
+  if (!claim.heal && ev.k === "kill") ev.a = claim.a;
+  if (claim.heal && (ev.k === "healed" || ev.k === "up")) ev.by = claim.a;
 }
 
 /**
@@ -1548,8 +1649,11 @@ async function onUpdateChatMessage(msg, changes) {
 
   if (!changes.flags?.["pf2e-toolbelt"]?.targetHelper) return;
   const variants = msg.flags?.["pf2e-toolbelt"]?.targetHelper?.saveVariants ?? {};
+  // A Target Helper update with no saves in it (targets picked, a card moved) isn't play to record
+  if (!Object.values(variants).some((v) => Object.keys(v?.saves ?? {}).length)) return;
   const scene = game.scenes.get(msg.speaker?.scene) ?? canvas.scene;
   const s = await activeSession();
+  if (!s) return;
   const data = await Store.load(s.id);
   const WINDOW = 10 * 60 * 1000;
   const COPY_WINDOW = 3 * 60 * 1000;
@@ -1634,7 +1738,12 @@ async function onUpdateActor(actor, changes, options = {}, userId = null) {
     const before = Rec.recent.get(actor.uuid);
     const recent = { t: now(), evs: before?.dyingOnly && lostHp > 0 && now() - before.t <= 5000 ? [...before.evs] : [] };
     Rec.recent.set(actor.uuid, recent);
-    const keep = (ev) => ev && recent.evs.push(ev);
+    const keep = (ev) => {
+      if (!ev) return;
+      recent.evs.push(ev);
+      // The card came first (it claimed this change while its events were being recorded)
+      if (recent.claim) claimEvent(recent.claim, ev);
+    };
     if (lostHp > 0) keep(await record({ k: "taken", a: w, amt: lostHp + lostTemp, ...(lostTemp ? { temp: lostTemp } : {}), by: attribution(actor, Rec.lastHit) }));
     if (gained > 0 && !maxChanged) keep(await record({ k: "healed", a: w, amt: gained, by: attribution(actor, Rec.lastHeal) }));
     if (prevHp.v > 0 && hp.v <= 0) {
@@ -1678,8 +1787,30 @@ async function onDying(item, changes = null) {
   if (was !== undefined && v <= was) return;
   const evs = [await record({ k: "dying", a: who(actor), v })];
   const max = actor.system?.attributes?.dying?.max ?? 4;
-  if (v >= max) evs.push(await record({ k: "dead", a: who(actor) }));
+  if (v >= max && !(await alreadyDead(who(actor)))) evs.push(await record({ k: "dead", a: who(actor) }));
   tagToCard(actor, evs.filter(Boolean));
+}
+
+/** Dead in the running session and not back up since, so a second sign of the same death isn't counted again. */
+async function alreadyDead(w) {
+  const s = await activeSession({ create: false });
+  if (!s || !w) return false;
+  const data = await Store.load(s.id);
+  return data.events.findLast((e) => e.a?.k === w.k && (e.k === "dead" || e.k === "up"))?.k === "dead";
+}
+
+/**
+ * A party member marked dead (Foundry's dead status, from the token or the combat tracker) without Dying reaching its
+ * maximum: a death effect, or the GM's ruling.
+ */
+async function onDeadStatus(effect) {
+  if (!effect?.statuses?.has?.("dead")) return;
+  const actor = effect.parent;
+  if (actor?.documentName !== "Actor" || !recording() || !(await isRecorder())) return;
+  const w = who(actor);
+  if (!w?.p || (await alreadyDead(w))) return;
+  const ev = await record({ k: "dead", a: w });
+  if (ev) tagToCard(actor, [ev]);
 }
 
 /**
@@ -1737,6 +1868,7 @@ async function onCombatStart(combat) {
   for (const c of combat.combatants) snapCombatant(c);
   if (!recording() || !(await isRecorder())) return;
   const s = await activeSession();
+  if (!s) return;
   const data = await Store.load(s.id);
   Rec.encounter = combat.id;
   if (!data.encounters.find((e) => e.id === combat.id)) {
@@ -1760,6 +1892,8 @@ async function onUpdateCombat(combat, changes) {
   if (!f?.enc) return;
   f.enc.rounds = Math.max(f.enc.rounds, combat.round);
   Store.scheduleSave(f.sid);
+  // The end of a round is a good moment to save
+  Store.saveSoon().catch((e) => console.error(MOD, e));
 }
 
 async function onCreateCombatant(combatant) {
@@ -1788,6 +1922,7 @@ async function onDeleteCombat(combat) {
     if (row) row.hp1 = c.actor?.system?.attributes?.hp?.value ?? null;
   }
   Store.scheduleSave(f.sid);
+  Store.saveSoon().catch((e) => console.error(MOD, e));
   refreshOpenApps();
 }
 
@@ -1800,7 +1935,7 @@ function blank(w) {
     k: w.k, n: w.n, p: w.p,
     atk: 0, atkKnown: 0, hit: 0, crit: 0, critFail: 0, weapons: {},
     dmg: 0, dmgBest: 0, dmgBestIt: null, dmgRolls: 0,
-    dealt: 0, dealtBest: 0, dealtBestIt: null, healDone: 0,
+    dealt: 0, dealtBest: 0, dealtBestIt: null, ff: 0, healDone: 0,
     heal: 0, healBest: 0,
     taken: 0, takenBest: 0, takenBestBy: null, critTaken: 0, healed: 0,
     kills: 0, killed: {}, down: 0, dyingMax: 0, dead: 0, revived: 0, revivedBy: 0,
@@ -1865,6 +2000,14 @@ function aggregate(events) {
       }
       case "dealt": {
         if (!a) break;
+        // Damage a creature did to itself (sessions before 1.2.0 credited unattributed persistent ticks to the victim)
+        // is nobody's: neither dealt nor friendly fire
+        if (e.tg?.k && e.tg.k === a.k) break;
+        // Damage to their own side (an ally caught in a blast) is friendly fire, not damage dealt
+        if (e.tg?.k && !!e.tg.p === !!a.p) {
+          a.ff += e.amt;
+          break;
+        }
         a.dealt += e.amt;
         if (e.amt > a.dealtBest) {
           a.dealtBest = e.amt;
@@ -1992,6 +2135,9 @@ const ATTACK_RESULT = ["critical miss", "miss", "hit", "critical hit"];
 const CHECK_RESULT = ["critical failure", "failure", "success", "critical success"];
 
 /** One line of the round-by-round log, or null for events the log leaves out. */
+/** What an entry is, in a word or two, for the correction button's name. */
+const ENTRY_WORD = { atk: "attack", dealt: "damage dealt", healdone: "healing", save: "save", skill: "skill check", rec: "recovery check", spell: "spell", ability: "ability", down: "down", kill: "kill", up: "back up", dying: "dying", dead: "death", reroll: "reroll", hero: "Hero Point", taken: "damage taken", healed: "healed" };
+
 function describe(e) {
   const a = esc(e.a?.n ?? "Someone");
   const tg = e.tg ? esc(e.tg.n) : null;
@@ -2010,6 +2156,9 @@ function describe(e) {
     case "down": return `<b>${a} goes down</b>${e.by ? ` (${esc(e.by.n)})` : ""}`;
     case "kill": return `<b>${esc(e.v?.n ?? "A foe")} falls</b>${e.a ? ` to ${a}` : ""}`;
     case "up": return `${a} is back up${e.by ? ` thanks to ${esc(e.by.n)}` : ""}`;
+    // HP changed with no chat card claiming it: applied by hand
+    case "taken": return e.m ? null : `${a} takes <b>${e.amt}</b> damage (applied by hand)${e.by ? `, credited to ${esc(e.by.n)}` : ""}`;
+    case "healed": return e.m ? null : `${a} is healed for <b>${e.amt}</b> (applied by hand)${e.by ? `, credited to ${esc(e.by.n)}` : ""}`;
     case "dying": return `${a} is dying ${e.v ?? ""}`;
     case "dead": return `<b>${a} dies</b>`;
     case "reroll": return `${a} rerolls${e.hero ? " with a Hero Point" : ""}${res(CHECK_RESULT, e.to)}`;
@@ -2050,11 +2199,18 @@ function diceStats(vals) {
   return { n, mean, median, mode, counts, nat20: counts[20], nat1: counts[1], luck: mean - 10.5 };
 }
 
+/**
+ * How a set of d20s compares with a fair die, judged against what chance alone explains: a fair d20's average wanders
+ * by about 5.77 / sqrt(rolls) either way. Within that it's about average; beyond twice that, running hot or cold; in
+ * between, just the number.
+ */
 function luckText(st) {
   if (st.n < 10) return "Too few rolls";
   const l = st.luck;
-  if (Math.abs(l) < 0.25) return "Right on average";
-  return `${l > 0 ? "+" : "−"}${Math.abs(l).toFixed(1)} ${l > 0 ? "above" : "below"} average`;
+  const spread = 5.77 / Math.sqrt(st.n);
+  if (Math.abs(l) <= spread) return "About average";
+  if (Math.abs(l) > 2 * spread) return l > 0 ? "Running hot" : "Running cold";
+  return `${l > 0 ? "+" : "−"}${Math.abs(l).toFixed(1)}`;
 }
 
 /** d20 histogram as inline SVG: one bar per face, a dashed line where a fair die would sit. */
@@ -2089,7 +2245,151 @@ function histogram(st) {
 }
 
 /** The recap card for a session, or null if nothing was recorded. */
-async function recapHTML(sessionId) {
+/** The player characters who did anything in a set of events (allies left out), by their names today. */
+function presentIn(events) {
+  const names = new Map();
+  for (const e of events) {
+    const w = e?.a;
+    // A Hero Point reset touches every character, there or not
+    if (!w?.p || typeof w.k !== "string" || isAlly(w) || (e.k === "hero" && e.lost)) continue;
+    names.set(w.k, w.k.startsWith("a:") ? (game.actors.get(w.k.slice(2))?.name ?? w.n) : w.n);
+  }
+  return [...names.values()].sort((a, b) => a.localeCompare(b));
+}
+
+/** Copper as coins: "12 gp 5 sp". */
+function fmtCoins(cp) {
+  const n = Math.round(Math.abs(cp));
+  const parts = [[Math.floor(n / 100), "gp"], [Math.floor((n % 100) / 10), "sp"], [n % 10, "cp"]].filter(([v]) => v).map(([v, u]) => `${v} ${u}`);
+  return parts.join(" ") || "0 gp";
+}
+
+/**
+ * Recap lines from the author's other modules, when they're on: clues found (Campaign Trackers), money spent and
+ * earned at the market (Marketplace, GM only), people met (NPC Attitudes). Each one line, only when there is
+ * something to say, and only what the players already know.
+ */
+function otherModulesLines(s, { b, t }) {
+  const from = s.start;
+  const to = s.end ?? now();
+  const within = (x) => typeof x === "number" && x >= from && x <= to;
+  const lines = [];
+  try {
+    const api = game.modules.get("pf2e-campaign-trackers")?.active ? game.modules.get("pf2e-campaign-trackers").api : null;
+    if (typeof api?.list === "function") {
+      let n = 0;
+      const quests = new Set();
+      for (const q of api.list() ?? []) {
+        if (q?.kind !== "quest" || !q.revealed) continue;
+        for (const e of q.entries ?? []) if (e?.revealed && within(e.revealedAt)) {
+          n++;
+          quests.add(q.name);
+        }
+      }
+      if (n) lines.push(`Clues found: ${n}${quests.size ? ` (${[...quests].map((x) => t(x)).join(", ")})` : ""}`);
+    }
+  } catch (e) {
+    console.warn(MOD, "couldn't read Campaign Trackers", e);
+  }
+  try {
+    if (game.user.isGM && game.modules.get("pf2e-marketplace")?.active) {
+      const log = game.settings.get("pf2e-marketplace", "log");
+      let spent = 0, earned = 0, trades = 0;
+      for (const e of Array.isArray(log) ? log : []) {
+        if (!within(e?.t) || typeof e.cp !== "number") continue;
+        if (e.kind === "buy") spent += e.cp;
+        else if (e.kind === "sell") earned += e.cp;
+        else continue;
+        trades++;
+      }
+      if (trades) lines.push(`At the market: ${fmtCoins(spent)} spent, ${fmtCoins(earned)} earned`);
+    }
+  } catch (e) {
+    console.warn(MOD, "couldn't read the Marketplace trade log", e);
+  }
+  try {
+    const api = game.modules.get("pf2e-npc-attitudes")?.active ? game.modules.get("pf2e-npc-attitudes").api : null;
+    if (typeof api?.record === "function") {
+      const met = game.actors
+        .filter((a) => a.type === "npc")
+        .filter((a) => {
+          const r = api.record(a);
+          return r?.met && !r.archived && within(r.metOn);
+        })
+        .map((a) => (typeof api.knownName === "function" ? api.knownName(a) : a.name));
+      if (met.length) lines.push(`People met: ${met.map((x) => b(x)).join(", ")}`);
+    }
+  } catch (e) {
+    console.warn(MOD, "couldn't read NPC Attitudes", e);
+  }
+  return lines;
+}
+
+/** A session's numbers as Markdown, to go beside a recap: who was there, the highlights, the party table. */
+async function statsMarkdown(sessionId) {
+  const r = await recapLines(sessionId, { b: (x) => `**${mdEscape(String(x))}**`, t: (x) => mdEscape(String(x)) });
+  if (!r) return null;
+  const cols = [["Character", (a) => mdEscape(a.n)], ["Attacks", (a) => a.atk], ["Hit %", (a) => pct(a.hit, a.atkKnown)], ["Crits", (a) => a.crit], ["Damage", (a) => a.dealt], ["Friendly fire", (a) => a.ff], ["Kills", (a) => a.kills], ["Taken", (a) => a.taken], ["Healing", (a) => a.healDone], ["Downed", (a) => a.down], ["Nat 20", (a) => a.nat20], ["Nat 1", (a) => a.nat1]];
+  const table = (rows) => [`| ${cols.map(([h]) => h).join(" | ")} |`, `|${cols.map(() => " --- ").join("|")}|`, ...rows.map((a) => `| ${cols.map(([, f]) => f(a) ?? 0).join(" | ")} |`)].join("\n");
+  const byName = (x, y) => x.n.localeCompare(y.n);
+  const chars = r.party.filter((a) => !isAlly(a)).sort(byName);
+  const allies = r.party.filter(isAlly).sort(byName);
+  const out = [`# ${mdEscape(r.s.name)}`, "", [fmtDate(r.s.start), ...r.sub].join(" · ")];
+  if (r.present.length) out.push("", `Present: ${r.present.map((x) => mdEscape(x)).join(", ")}`);
+  if (r.lines.length) out.push("", "## By the numbers", "", ...r.lines.map((l) => `- ${l}`));
+  if (chars.length) out.push("", "## The party", "", table(chars));
+  if (allies.length) out.push("", "## Allies and companions", "", table(allies));
+  return `${out.join("\n")}\n`;
+}
+
+async function exportStats(sessionId) {
+  const md = await statsMarkdown(sessionId);
+  if (!md) return ui.notifications.warn("Campaign Ledger: nothing recorded in that session yet.");
+  const s = Store.index.sessions.find((x) => x.id === sessionId);
+  const name = (s?.name ?? "session").replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "").toLowerCase() || "session";
+  const date = s?.start ? `-${new Date(s.start).toISOString().slice(0, 10)}` : "";
+  foundry.utils.saveDataToFile(md, "text/markdown", `${name}${date}-stats.md`);
+}
+
+/**
+ * Per-session party totals for the Sessions tab (who was there, and the trend lines): { present, hit, known, dealt,
+ * taken, down }, from the session's events. Kept per session until its events change.
+ */
+const summaries = new Map();
+function summaryOf(sid, data) {
+  // (new or removed events change the length or the last id; a correction moves Store.fixes)
+  const key = `${data.events.length}|${data.events.at(-1)?.id ?? ""}|${Store.fixes}`;
+  const had = summaries.get(sid);
+  if (had?.key === key) return had.v;
+  const rows = [...aggregate(data.events).values()].filter((a) => a.p);
+  const sum = (k) => rows.reduce((x, a) => x + (a[k] ?? 0), 0);
+  const v = { present: presentIn(data.events), hit: sum("hit"), known: sum("atkKnown"), dealt: sum("dealt"), taken: sum("taken"), down: sum("down") };
+  summaries.set(sid, { key, v });
+  return v;
+}
+
+/**
+ * One small line chart: a value per session, oldest first. Each point carries its session and value in a plain-text
+ * tooltip, and the latest value is written at the end.
+ */
+function trendChart(title, points, fmt) {
+  const W = 240, H = 64, pad = 8;
+  const vals = points.map((p) => p.v).filter((v) => typeof v === "number");
+  if (vals.length < 2) return "";
+  const max = Math.max(...vals, 1);
+  const x = (i) => pad + (i * (W - 2 * pad)) / Math.max(1, points.length - 1);
+  const y = (v) => H - pad - (v / max) * (H - 2 * pad);
+  const pts = points.map((p, i) => (typeof p.v === "number" ? [x(i), y(p.v), p] : null)).filter(Boolean);
+  const path = pts.map(([px, py], i) => `${i ? "L" : "M"}${px.toFixed(1)},${py.toFixed(1)}`).join(" ");
+  const dots = pts.map(([px, py, p]) => `<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="4" class="pcl-trend-dot"${tipAttr(`${p.name}: ${fmt(p.v)}`)}></circle>`).join("");
+  const last = pts.at(-1)[2];
+  return `<figure class="pcl-trend"><figcaption>${esc(title)} <strong>${esc(fmt(last.v))}</strong></figcaption>
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(`${title}, per session: ${pts.map(([, , p]) => `${p.name} ${fmt(p.v)}`).join("; ")}`)}">
+      <line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}" class="pcl-trend-base"></line>
+      <path d="${path}" class="pcl-trend-line"></path>${dots}</svg></figure>`;
+}
+
+async function recapLines(sessionId, { b, t }) {
   const s = Store.index.sessions.find((x) => x.id === sessionId);
   if (!s) return null;
   const data = await Store.load(sessionId);
@@ -2099,42 +2399,53 @@ async function recapHTML(sessionId) {
   const total = (key) => party.reduce((x, a) => x + (a[key] ?? 0), 0);
   const li = [];
   const big = top("dealtBest");
-  if (big) li.push(`Biggest hit: <b>${esc(big.n)}</b>, ${big.dealtBest} damage${big.dealtBestIt ? ` with ${esc(big.dealtBestIt)}` : ""}`);
+  if (big) li.push(`Biggest hit: ${b(big.n)}, ${big.dealtBest} damage${big.dealtBestIt ? ` with ${t(big.dealtBestIt)}` : ""}`);
   const dmg = top("dealt");
-  if (dmg) li.push(`Most damage: <b>${esc(dmg.n)}</b>, ${dmg.dealt} in total`);
+  if (dmg) li.push(`Most damage: ${b(dmg.n)}, ${dmg.dealt} in total`);
   const crit = top("crit");
-  if (crit) li.push(`Most crits: <b>${esc(crit.n)}</b> (${crit.crit})`);
+  if (crit) li.push(`Most crits: ${b(crit.n)} (${crit.crit})`);
   const kills = total("kills");
   const killer = top("kills");
-  if (kills) li.push(`Foes felled: ${kills}${killer ? `, most by <b>${esc(killer.n)}</b> (${killer.kills})` : ""}`);
-  const downs = party.filter((a) => a.down).map((a) => `${esc(a.n)}${a.down > 1 ? ` ×${a.down}` : ""}`);
+  if (kills) li.push(`Foes felled: ${kills}${killer ? `, most by ${b(killer.n)} (${killer.kills})` : ""}`);
+  const downs = party.filter((a) => a.down).map((a) => `${t(a.n)}${a.down > 1 ? ` ×${a.down}` : ""}`);
   if (downs.length) li.push(`Went down: ${downs.join(", ")}`);
-  const savers = party.filter((a) => a.revivedBy).map((a) => `${esc(a.n)}${a.revivedBy > 1 ? ` ×${a.revivedBy}` : ""}`);
+  const savers = party.filter((a) => a.revivedBy).map((a) => `${t(a.n)}${a.revivedBy > 1 ? ` ×${a.revivedBy}` : ""}`);
   if (savers.length) li.push(`Brought someone back: ${savers.join(", ")}`);
   const spells = top("spellN");
-  if (spells) li.push(`Most spells: <b>${esc(spells.n)}</b> (${spells.spellN})`);
+  if (spells) li.push(`Most spells: ${b(spells.n)} (${spells.spellN})`);
   const forced = top("forcedFail");
-  if (forced) li.push(`Most saves failed against them: <b>${esc(forced.n)}</b> (${forced.forcedFail} of ${forced.forced})`);
+  if (forced) li.push(`Most saves failed against them: ${b(forced.n)} (${forced.forcedFail} of ${forced.forced})`);
   const skills = top("skillPass");
-  if (skills) li.push(`Most skill successes: <b>${esc(skills.n)}</b> (${skills.skillPass})`);
+  if (skills) li.push(`Most skill successes: ${b(skills.n)} (${skills.skillPass})`);
   const heal = top("healDone");
-  if (heal) li.push(`Most healing: <b>${esc(heal.n)}</b>, ${heal.healDone} HP`);
-  const n20 = party.filter((a) => a.nat20).map((a) => `${esc(a.n)}${a.nat20 > 1 ? ` ×${a.nat20}` : ""}`);
+  if (heal) li.push(`Most healing: ${b(heal.n)}, ${heal.healDone} HP`);
+  const n20 = party.filter((a) => a.nat20).map((a) => `${t(a.n)}${a.nat20 > 1 ? ` ×${a.nat20}` : ""}`);
   if (n20.length) li.push(`Natural 20s: ${n20.join(", ")}`);
-  const n1 = party.filter((a) => a.nat1).map((a) => `${esc(a.n)}${a.nat1 > 1 ? ` ×${a.nat1}` : ""}`);
+  const n1 = party.filter((a) => a.nat1).map((a) => `${t(a.n)}${a.nat1 > 1 ? ` ×${a.nat1}` : ""}`);
   if (n1.length) li.push(`Natural 1s: ${n1.join(", ")}`);
+  const ff = party.filter((a) => a.ff).sort((x, y) => y.ff - x.ff).map((a) => `${t(a.n)} (${a.ff})`);
+  if (ff.length) li.push(`Friendly fire: ${ff.join(", ")}`);
   const hero = total("hero");
   if (hero) li.push(`Hero Points spent: ${hero}`);
+  li.push(...otherModulesLines(s, { b, t }));
   const encs = data.encounters.length;
-  const sub = [fmtDuration((s.end ?? now()) - s.start), `${encs} encounter${encs === 1 ? "" : "s"}`].filter((x) => x && x !== "–").join(" · ");
-  return `<div class="pcl-recap"><h3><i class="fa-solid fa-book-open-reader"></i> ${esc(s.name)}</h3>${sub ? `<p class="pcl-recap-sub">${sub}</p>` : ""}<ul>${li.map((l) => `<li>${l}</li>`).join("")}</ul></div>`;
+  const sub = [fmtDuration((s.end ?? now()) - s.start), `${encs} encounter${encs === 1 ? "" : "s"}`].filter((x) => x && x !== "–");
+  return { s, data, party, sub, present: presentIn(data.events), lines: li };
 }
 
-async function postRecap(sessionId, { manual = false } = {}) {
+async function recapHTML(sessionId) {
+  const r = await recapLines(sessionId, { b: (x) => `<b>${esc(x)}</b>`, t: esc });
+  if (!r) return null;
+  const present = r.present.length ? `<p class="pcl-recap-sub">${esc(r.present.join(", "))}</p>` : "";
+  return `<div class="pcl-recap"><h3><i class="fa-solid fa-book-open-reader"></i> ${esc(r.s.name)}</h3>${r.sub.length ? `<p class="pcl-recap-sub">${r.sub.join(" · ")}</p>` : ""}${present}<ul>${r.lines.map((l) => `<li>${l}</li>`).join("")}</ul></div>`;
+}
+
+async function postRecap(sessionId, { manual = false, auto = false } = {}) {
   const content = await recapHTML(sessionId);
   if (!content) return false;
   const mode = game.settings.get(MOD, "recap");
-  const gmOnly = mode === "gm" || (manual && mode === "off");
+  // An evening that ended by itself is noticed at the start of the next one: its recap goes to the GM to repost
+  const gmOnly = mode === "gm" || auto || (manual && mode === "off");
   await ChatMessage.create({
     content,
     speaker: { alias: "Campaign Ledger" },
@@ -2165,6 +2476,7 @@ const PARTY_COLUMNS = [
   { key: "hitRate", label: "Hit %", group: "Offense", fmt: (a) => pct(a.hit, a.atkKnown), tip: "Of attacks rolled against a target" },
   { key: "crit", label: "Crits", group: "Offense" },
   { key: "dealt", label: "Damage", group: "Offense", tip: "Damage dealt, after resistances and not counting overkill. Hover a number for the amount rolled.", tipf: (a) => `${a.dmg} rolled` },
+  { key: "ff", label: "Friendly fire", group: "Offense", tip: "Damage dealt to their own side, not counted in Damage" },
   { key: "dealtBest", label: "Best hit", group: "Offense", fmt: (a) => (a.dealtBest ? `${a.dealtBest}` : "–"), tipf: (a) => a.dealtBestIt ?? "" },
   { key: "kills", label: "Kills", group: "Offense" },
   { key: "spellN", label: "Spells", group: "Spells and skills", tip: "Spells cast, cantrips included" },
@@ -2182,7 +2494,7 @@ const PARTY_COLUMNS = [
   { key: "rerolls", label: "Rerolls", group: "Dice", fmt: (a) => (a.rerolls ? `${a.rerollsBetter}/${a.rerolls}` : "–"), tip: "Rerolls that improved the result / all rerolls" },
 ];
 
-class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "main", from: `${MOD}.size` }) {
+class LedgerApp extends keyboardWindow(rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "main", from: `${MOD}.size` }), { module: MOD, scope: ".pcl-app", ownKeys: true }) {
   static DEFAULT_OPTIONS = {
     id: "pf2e-campaign-ledger",
     classes: ["pcl-app"],
@@ -2215,12 +2527,14 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
       viewSession: LedgerApp.#onViewSession,
       archiveChat: LedgerApp.#onArchiveChat,
       viewChat: LedgerApp.#onViewChat,
+      exportStats: LedgerApp.#onExportStats,
+      correctEntry: LedgerApp.#onCorrectEntry,
     },
   };
 
   // The tab, scope and sort survive closing the window
   static lastState = null;
-  state = LedgerApp.lastState ?? { tab: "party", scope: "all", sort: { key: "dealt", dir: -1 }, char: null, enc: null, diceWho: "party", diceKind: "all" };
+  state = LedgerApp.lastState ?? { tab: "party", scope: Store.index.active ? `session:${Store.index.active}` : "all", sort: { key: "dealt", dir: -1 }, char: null, enc: null, diceWho: "party", diceKind: "all" };
   rev = -1; // Store.rev this window shows
 
   get isGM() {
@@ -2254,7 +2568,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
       el.innerHTML = `<section class="pcl-body"><p class="pcl-empty">The GM hasn't opened the Campaign Ledger to players.</p></section>`;
       return el;
     }
-    el.innerHTML = this.#header(ctx) + this.#tabs() + `<section class="pcl-body">${this.#body(ctx)}</section>`;
+    el.innerHTML = this.#header(ctx) + this.#tabs() + `<section class="pcl-body" id="pcl-panel" role="tabpanel" aria-labelledby="pcl-tab-${this.state.tab}" data-focus-pane="body" data-focus-start data-keep-scroll="body" tabindex="-1">${this.#body(ctx)}</section>`;
     return el;
   }
 
@@ -2347,14 +2661,17 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
       </div>`;
     }
     return `<header class="pcl-head">
-      <div class="pcl-scope"><label>Showing <select name="scope">${scope}</select></label>
-      <button type="button" data-action="refresh" data-tooltip-text="Reload"><i class="fa-solid fa-rotate"></i></button></div>
+      <div class="pcl-scope"><label>Showing <select name="scope" aria-label="Showing">${scope}</select></label>
+      <button type="button" data-action="refresh"${labelAttr("Reload")}><i class="fa-solid fa-rotate" aria-hidden="true"></i></button></div>
       ${live}${gm}</header>`;
   }
 
   #tabs() {
     const t = [["party", "Party", "fa-users"], ["character", "Characters", "fa-user"], ["encounters", "Encounters", "fa-swords"], ["dice", "Dice", "fa-dice-d20"], ["sessions", "Sessions", "fa-calendar-days"]];
-    return `<div class="pcl-tabs">${t.map(([id, label, icon]) => `<a data-action="pclTab" data-tab="${id}" class="${this.state.tab === id ? "active" : ""}"><i class="fa-solid ${icon}"></i> ${label}</a>`).join("")}</div>`;
+    return `<div class="pcl-tabs" role="tablist" aria-label="Ledger">${t.map(([id, label, icon]) => {
+      const sel = this.state.tab === id;
+      return `<button type="button" role="tab" data-action="pclTab" data-tab="${id}" class="${sel ? "active" : ""}" aria-selected="${sel}" aria-controls="pcl-panel" id="pcl-tab-${id}"${sel ? " data-focus-home" : ""}><i class="fa-solid ${icon}" aria-hidden="true"></i> ${label}</button>`;
+    }).join("")}</div>`;
   }
 
   #body(ctx) {
@@ -2387,14 +2704,18 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     const head1 = groups.map((g) => `<th colspan="${g.span}" class="pcl-group">${g.name}</th>`).join("");
     const head2 = PARTY_COLUMNS.map((c) => {
       const arrow = c.key === key ? (dir < 0 ? " ▾" : " ▴") : "";
-      return `<th data-action="sort" data-key="${c.key}" ${c.tip ? `data-tooltip-text="${esc(c.tip)}"` : ""}>${c.label}${arrow}</th>`;
+      const sortState = c.key === key ? ` aria-sort="${dir < 0 ? "descending" : "ascending"}"` : "";
+      return `<th${sortState}><button type="button" class="pcl-sort" data-action="sort" data-key="${c.key}" ${c.tip ? `data-tooltip-text="${esc(c.tip)}"` : ""}>${c.label}${arrow}</button></th>`;
     }).join("");
-    const rows = party.map((a) => `<tr>${PARTY_COLUMNS.map((c) => {
+    const row = (a) => `<tr>${PARTY_COLUMNS.map((c) => {
       const v = c.fmt ? c.fmt(a) : (a[c.key] ?? 0) || "–";
-      const lead = !c.text && party.length > 1 && best[c.key] > 0 && a[c.key] === best[c.key] && !["nat1", "taken", "critTaken", "down", "dead"].includes(c.key);
+      const lead = !c.text && party.length > 1 && best[c.key] > 0 && a[c.key] === best[c.key] && !["nat1", "taken", "critTaken", "down", "dead", "ff"].includes(c.key);
       const tip = c.tipf ? c.tipf(a) : "";
       return `<td class="${c.text ? "pcl-name" : ""} ${lead ? "pcl-lead" : ""}" ${tip ? `data-tooltip-text="${esc(tip)}"` : ""}>${v}</td>`;
-    }).join("")}</tr>`).join("");
+    }).join("")}</tr>`;
+    const allies = party.filter(isAlly);
+    const chars = party.filter((a) => !isAlly(a));
+    const rows = chars.map(row).join("") + (allies.length ? `<tr class="pcl-subhead"><th colspan="${PARTY_COLUMNS.length}">Allies and companions</th></tr>${allies.map(row).join("")}` : "");
     return this.#highlights(party, data) + `<table class="pcl-table pcl-party"><thead><tr>${head1}</tr><tr>${head2}</tr></thead><tbody>${rows}</tbody></table>
       <p class="pcl-note">Damage and healing are what was applied from a chat card, after resistances; hover for the amount rolled. Damage taken is what came off HP, with any temporary HP that went with it. Click a column to sort.</p>`;
   }
@@ -2425,7 +2746,9 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!party.length) return `<p class="pcl-empty">Nothing recorded for this selection yet.</p>`;
     if (!party.some((a) => a.k === this.state.char)) this.state.char = party[0].k;
     const a = stats.get(this.state.char);
-    const select = `<select name="char">${party.map((p) => `<option value="${p.k}" ${p.k === a.k ? "selected" : ""}>${esc(p.n)}</option>`).join("")}</select>`;
+    const opt = (p) => `<option value="${esc(p.k)}" ${p.k === a.k ? "selected" : ""}>${esc(p.n)}</option>`;
+    const allies = party.filter(isAlly);
+    const select = `<select name="char" aria-label="Character">${allies.length ? `<optgroup label="Characters">${party.filter((p) => !isAlly(p)).map(opt).join("")}</optgroup><optgroup label="Allies and companions">${allies.map(opt).join("")}</optgroup>` : party.map(opt).join("")}</select>`;
     const table = (cols, rows) => rows.length
       ? `<table class="pcl-table"><thead><tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((v, i) => `<td class="${i === 0 ? "pcl-name" : ""}">${v}</td>`).join("")}</tr>`).join("")}</tbody></table>`
       : `<p class="pcl-empty">None yet.</p>`;
@@ -2444,7 +2767,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
         ${fact("Encounters", a.encounters.size)}
         ${fact("Attacks", `${a.atk} · ${pct(a.hit, a.atkKnown)} hit`)}
         ${fact("Crits", `${a.crit} dealt · ${a.critTaken} taken`)}
-        ${fact("Damage dealt", `${a.dealt} · ${a.dmg} rolled${a.dealtBest ? ` · best ${a.dealtBest}` : ""}`)}
+        ${fact("Damage dealt", `${a.dealt} · ${a.dmg} rolled${a.dealtBest ? ` · best ${a.dealtBest}` : ""}${a.ff ? ` · ${a.ff} to their own side` : ""}`)}
         ${fact("Damage taken", `${a.taken}${a.takenBest ? ` · worst ${a.takenBest}${a.takenBestBy ? ` (${esc(a.takenBestBy)})` : ""}` : ""}`)}
         ${fact("Healing", `${a.healDone} given (${a.heal} rolled) · ${a.healed} received`)}
         ${fact("Downed", `${a.down}${a.dyingMax ? ` · worst dying ${a.dyingMax}` : ""}${a.dead ? ` · died ${a.dead}` : ""}`)}
@@ -2480,12 +2803,12 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
       let detail = "";
       if (open) {
         const list = this.isGM ? [...party, ...foes] : party;
-        detail = `<tr class="pcl-detail"><td colspan="10"><table class="pcl-table"><thead><tr><th>Combatant</th><th>Attacks</th><th>Hit %</th><th>Crits</th><th>Damage</th><th data-tooltip-text="Spells cast">Spells</th><th data-tooltip-text="Saves forced on the other side: failed / rolled">Saves forced</th><th data-tooltip-text="Skill checks that succeeded / against a DC">Skills</th><th data-tooltip-text="Actions and feats used">Abilities</th><th>Healing</th><th>Taken</th><th>Kills</th><th>Downed</th></tr></thead><tbody>
+        detail = `<tr class="pcl-detail" id="pcl-enc-${esc(enc.id)}"><td colspan="10"><table class="pcl-table"><thead><tr><th>Combatant</th><th>Attacks</th><th>Hit %</th><th>Crits</th><th>Damage</th><th data-tooltip-text="Spells cast">Spells</th><th data-tooltip-text="Saves forced on the other side: failed / rolled">Saves forced</th><th data-tooltip-text="Skill checks that succeeded / against a DC">Skills</th><th data-tooltip-text="Actions and feats used">Abilities</th><th>Healing</th><th>Taken</th><th>Kills</th><th>Downed</th></tr></thead><tbody>
           ${list.map((a) => `<tr class="${a.p ? "" : "pcl-foe"}"><td class="pcl-name">${esc(a.n)}</td><td>${a.atk || "–"}</td><td>${pct(a.hit, a.atkKnown)}</td><td>${a.crit || "–"}</td><td>${a.dealt || "–"}</td><td>${a.spellN || "–"}</td><td>${a.forced ? `${a.forcedFail}/${a.forced}` : "–"}</td><td>${a.skillN ? `${a.skillPass}/${a.skillKnown}` : "–"}</td><td>${a.abilityN || "–"}</td><td>${a.healDone || "–"}</td><td>${a.taken || "–"}</td><td>${a.kills || "–"}</td><td>${a.down || "–"}</td></tr>`).join("")}
           </tbody></table>${this.#roundLog(evs)}</td></tr>`;
       }
       return `<tr class="pcl-click" data-action="encounter" data-id="${esc(enc.id)}">
-        <td>${fmtDate(enc.start)}</td><td>${esc(sessName(enc.sid))}</td><td class="pcl-name">${esc(enc.name || enc.scene)}${this.isGM ? ` <a data-action="renameEncounter" data-id="${esc(enc.id)}" data-sid="${esc(enc.sid)}" data-tooltip-text="Rename this encounter"><i class="fa-solid fa-pencil"></i></a>` : ""}</td>
+        <td><button type="button" class="pcl-rowbtn" data-action="encounter" data-id="${esc(enc.id)}" aria-expanded="${open}" aria-controls="pcl-enc-${esc(enc.id)}" aria-label="${esc(`${fmtDate(enc.start)}, ${enc.name || enc.scene}`)}">${fmtDate(enc.start)}</button></td><td>${esc(sessName(enc.sid))}</td><td class="pcl-name">${esc(enc.name || enc.scene)}${this.isGM ? ` <button type="button" class="pcl-icon" data-action="renameEncounter" data-id="${esc(enc.id)}" data-sid="${esc(enc.sid)}"${labelAttr(`Rename ${enc.name || enc.scene}`)}><i class="fa-solid fa-pencil" aria-hidden="true"></i></button>` : ""}</td>
         <td>${enc.rounds}</td><td>${fmtDuration((enc.end ?? now()) - enc.start)}${enc.end ? "" : " (running)"}</td>
         <td>${sum(party, "dealt") || "–"}</td><td>${sum(foes, "dealt") || "–"}</td><td>${sum(party, "kills") || "–"}</td>
         <td>${sum(party, "down") || "–"}</td><td>${sum(party, "crit")} / ${sum(foes, "crit")}</td></tr>${detail}`;
@@ -2495,10 +2818,18 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
   }
 
   #roundLog(evs) {
+    // Each correction button's name says whose entry it is; a repeat (two Strikes in a round) gets a number
+    const named = new Map();
+    const fixName = (e) => {
+      const base = `Correct: ${e.a?.n ?? "nobody"}, round ${e.r}, ${ENTRY_WORD[e.k] ?? e.k}${e.tg?.n ? `, ${e.tg.n}` : ""}`;
+      const n = (named.get(base) ?? 0) + 1;
+      named.set(base, n);
+      return n > 1 ? `${base} (${n})` : base;
+    };
     const lines = evs
       .filter((e) => e.r && (this.isGM || e.a?.p))
       .sort((x, y) => x.r - y.r || (x.t ?? 0) - (y.t ?? 0))
-      .map((e) => ({ r: e.r, html: describe(e), foe: !e.a?.p }))
+      .map((e) => ({ r: e.r, html: describe(e), foe: !e.a?.p, fix: this.isGM && e.id ? ` <button type="button" class="pcl-icon pcl-fix" data-action="correctEntry" data-eid="${esc(e.id)}" data-sid="${esc(e.sid)}"${labelAttr(fixName(e))}><i class="fa-solid fa-pen" aria-hidden="true"></i></button>` : "" }))
       .filter((l) => l.html);
     if (!lines.length) return "";
     const rounds = [];
@@ -2506,7 +2837,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
       if (rounds.at(-1)?.r !== l.r) rounds.push({ r: l.r, lines: [] });
       rounds.at(-1).lines.push(l);
     }
-    return `<h3>Round by round</h3><div class="pcl-log">${rounds.map((g) => `<div class="pcl-round"><h4>Round ${g.r}</h4><ul>${g.lines.map((l) => `<li class="${l.foe ? "pcl-foe-line" : ""}">${l.html}</li>`).join("")}</ul></div>`).join("")}</div>`;
+    return `<h3>Round by round</h3><div class="pcl-log">${rounds.map((g) => `<div class="pcl-round"><h4>Round ${g.r}</h4><ul>${g.lines.map((l) => `<li class="${l.foe ? "pcl-foe-line" : ""}">${l.html}${l.fix}</li>`).join("")}</ul></div>`).join("")}</div>`;
   }
 
   #dice({ data }) {
@@ -2521,7 +2852,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!who.some(([k]) => k === this.state.diceWho)) this.state.diceWho = "party";
     const [, label, entries] = who.find(([k]) => k === this.state.diceWho);
     const st = diceStats(valsFor(entries));
-    const list = who.map(([k, n]) => `<a data-action="diceWho" data-who="${esc(k)}" class="${k === this.state.diceWho ? "active" : ""}">${esc(n)}</a>`).join("");
+    const list = who.map(([k, n]) => `<button type="button" data-action="diceWho" data-who="${esc(k)}" class="${k === this.state.diceWho ? "active" : ""}" aria-pressed="${k === this.state.diceWho}">${esc(n)}</button>`).join("");
     const kinds = KINDS.map(([k, n]) => `<option value="${k}" ${k === kind ? "selected" : ""}>${n}</option>`).join("");
     const tile = (l, v) => `<div class="pcl-tile"><span>${l}</span><strong>${v}</strong></div>`;
     const main = st
@@ -2545,28 +2876,46 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
   #sessions({ ix }) {
     const chatIcon = (s) => {
       const n = this.isGM ? archivesOf(s.id).reduce((t, a) => t + a.n, 0) : playersReadChat() ? (s.chat ?? []).reduce((t, a) => t + a.n, 0) : 0;
-      return n ? `<a data-action="viewChat" data-id="${s.id}" data-tooltip-text="Archived chat (${n} message${n === 1 ? "" : "s"})"><i class="fa-solid fa-comments"></i></a> ` : "";
+      return n ? `<button type="button" class="pcl-icon" data-action="viewChat" data-id="${esc(s.id)}"${labelAttr(`Archived chat (${n} message${n === 1 ? "" : "s"})`)}><i class="fa-solid fa-comments" aria-hidden="true"></i></button> ` : "";
     };
     const arcOpts = (sel) => [`<option value="">No arc</option>`, ...ix.arcs.map((a) => `<option value="${esc(a.id)}" ${a.id === sel ? "selected" : ""}>${esc(a.name)}</option>`)].join("");
+    // Who was there and the trend lines need every session's events; any not read yet are read, then the tab redraws
+    // (a session that couldn't be read is tried again only when the window is opened again)
+    this.unreadable ??= new Set();
+    const missing = ix.sessions.filter((s) => !Store.cache.has(s.id) && !this.unreadable.has(s.id)).map((s) => s.id);
+    if (missing.length && !this.filling) {
+      this.filling = Promise.allSettled(missing.map((id) => Store.load(id))).then((results) => {
+        results.forEach((r, i) => r.status === "rejected" && this.unreadable.add(missing[i]));
+        this.filling = null;
+        if (this.state.tab === "sessions") this.render();
+      });
+    }
+    const sum = (s) => (Store.cache.has(s.id) ? summaryOf(s.id, Store.cache.get(s.id)) : null);
     const rows = [...ix.sessions].reverse().map((s) => {
-      const name = this.isGM ? `<input type="text" data-edit="sessionName" data-id="${s.id}" value="${esc(s.name)}">` : esc(s.name);
-      const arc = this.isGM ? `<select data-edit="sessionArc" data-id="${s.id}">${arcOpts(s.arc)}</select>` : esc(ix.arcs.find((a) => a.id === s.arc)?.name ?? "–");
+      const name = this.isGM ? `<input type="text" data-edit="sessionName" data-id="${esc(s.id)}" value="${esc(s.name)}" aria-label="Session name">` : esc(s.name);
+      const arc = this.isGM ? `<select data-edit="sessionArc" data-id="${esc(s.id)}" aria-label="Arc of ${esc(s.name)}">${arcOpts(s.arc)}</select>` : esc(ix.arcs.find((a) => a.id === s.arc)?.name ?? "–");
       const state = s.id === ix.active ? `<span class="pcl-live"><i class="fa-solid fa-circle"></i> Recording</span>` : fmtDuration((s.end ?? s.start) - s.start);
       const gm = this.isGM
-        ? `<a data-action="recap" data-id="${s.id}" data-tooltip-text="Post a recap to chat"><i class="fa-solid fa-scroll"></i></a> <a data-action="deleteSession" data-id="${s.id}" data-tooltip-text="Delete session"><i class="fa-solid fa-trash"></i></a>`
+        ? `<button type="button" class="pcl-icon" data-action="recap" data-id="${esc(s.id)}"${labelAttr(`Post a recap of ${s.name} to chat`)}><i class="fa-solid fa-scroll" aria-hidden="true"></i></button> <button type="button" class="pcl-icon" data-action="deleteSession" data-id="${esc(s.id)}"${labelAttr(`Delete ${s.name}`)}><i class="fa-solid fa-trash" aria-hidden="true"></i></button>`
         : "";
-      return `<tr><td class="pcl-name">${name}</td><td>${arc}</td><td>${fmtDate(s.start)}</td><td>${state}</td>
-        <td><a data-action="viewSession" data-id="${s.id}" data-tooltip-text="Show this session"><i class="fa-solid fa-eye"></i></a> ${chatIcon(s)}${gm}</td></tr>`;
+      const present = sum(s)?.present ?? null;
+      return `<tr><td class="pcl-name">${name}</td><td>${arc}</td><td>${fmtDate(s.start)}</td><td>${state}</td><td class="pcl-present">${present ? esc(present.join(", ")) || "–" : this.unreadable.has(s.id) ? "Couldn't read" : "…"}</td>
+        <td class="pcl-actions"><button type="button" class="pcl-icon" data-action="viewSession" data-id="${esc(s.id)}"${labelAttr(`Show ${s.name}`)}><i class="fa-solid fa-eye" aria-hidden="true"></i></button> ${chatIcon(s)}<button type="button" class="pcl-icon" data-action="exportStats" data-id="${esc(s.id)}"${labelAttr(`Save the numbers of ${s.name} as Markdown`)}><i class="fa-solid fa-file-lines" aria-hidden="true"></i></button> ${gm}</td></tr>`;
     }).join("");
+    const points = ix.sessions.map((s) => ({ name: s.name, v: sum(s) })).filter((p) => p.v);
+    const trend = (title, f, fmt) => trendChart(title, points.map((p) => ({ name: p.name, v: f(p.v) })), fmt);
+    const trends = points.length >= 2
+      ? `<h3>Across sessions</h3><div class="pcl-trends">${trend("Party hit rate", (v) => (v.known ? v.hit / v.known : null), (v) => `${Math.round(v * 100)}%`)}${trend("Damage dealt", (v) => v.dealt, String)}${trend("Damage taken", (v) => v.taken, String)}${trend("Times downed", (v) => v.down, String)}</div>`
+      : "";
     const arcs = this.isGM
-      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${esc(a.id)}" value="${esc(a.name)}"></td><td>${((n) => `${n} session${n === 1 ? "" : "s"}`)(ix.sessions.filter((s) => s.arc === a.id).length)}</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
+      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${esc(a.id)}" value="${esc(a.name)}" aria-label="Arc name"></td><td>${((n) => `${n} session${n === 1 ? "" : "s"}`)(ix.sessions.filter((s) => s.arc === a.id).length)}</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
       : "";
     const tools = this.isGM
       ? `<div class="pcl-tools"><button type="button" data-action="exportData"><i class="fa-solid fa-file-export"></i> Export everything</button>
          <button type="button" data-action="importData" data-tooltip-text="Restore sessions and arcs from an export. Nothing already here is removed."><i class="fa-solid fa-file-import"></i> Import</button>
          <button type="button" data-action="reset" class="pcl-danger"><i class="fa-solid fa-trash-can"></i> Reset ledger</button></div>`
       : "";
-    return `${ix.sessions.length ? `<table class="pcl-table pcl-sessions"><thead><tr><th>Session</th><th>Arc</th><th>Date</th><th>Length</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="pcl-empty">No sessions yet.</p>`}${arcs}${tools}`;
+    return `${ix.sessions.length ? `<table class="pcl-table pcl-sessions"><thead><tr><th>Session</th><th>Arc</th><th>Date</th><th>Length</th><th>Who was there</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="pcl-empty">No sessions yet.</p>`}${trends}${arcs}${tools}`;
   }
 
   /* ---------- handlers ---------- */
@@ -2618,14 +2967,13 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!enc) return;
     const name = await foundry.applications.api.DialogV2.prompt({
       window: { title: "Rename encounter" },
-      content: `<p>A name for this encounter (players see it). Leave it empty to go back to the scene name.</p><input type="text" name="name" value="${esc(enc.name ?? "")}" placeholder="${esc(enc.scene)}" autofocus>`,
+      content: `<p>A name for this encounter (players see it). Leave it empty to go back to the scene name.</p><label class="pcl-check">Name <input type="text" name="name" value="${esc(enc.name ?? "")}" placeholder="${esc(enc.scene)}" autofocus></label>`,
       ok: { label: "Rename", callback: (ev, button) => button.form.elements.name.value.trim() },
     });
     if (name === null || name === undefined) return;
     if (name) enc.name = name;
     else delete enc.name;
-    await Store.save(sid);
-    await Store.mutateIndex(() => null);
+    if (await Store.save(sid)) announceSaved([sid]);
     this.render();
   }
 
@@ -2642,7 +2990,8 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!s) return;
     const n = game.messages.size;
     const offer = n > 0 && game.settings.get(MOD, "archiveOffer");
-    const box = offer ? `<label class="pcl-check"><input type="checkbox" name="archive" checked> Archive the chat log with this session and clear it (${n} message${n === 1 ? "" : "s"})</label>` : "";
+    const since = archivesOf(s.id).length ? " since the last archive" : "";
+    const box = offer ? `<label class="pcl-check"><input type="checkbox" name="archive" checked> Archive the chat log with this session and clear it (${n} message${n === 1 ? "" : "s"}${since})</label>` : "";
     const choice = await foundry.applications.api.DialogV2.wait({
       window: { title: "End session" },
       content: `<p>End <strong>${esc(s.name)}</strong>? The next roll starts a new session${game.settings.get(MOD, "recap") === "all" ? ", and the recap goes to everyone" : ""}.</p>${box}`,
@@ -2697,8 +3046,18 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!game.user.isGM) return;
     const s = Store.index.sessions.find((s) => s.id === target.dataset.id);
     if (!s) return;
-    const ok = await foundry.applications.api.DialogV2.confirm({ window: { title: "Delete session" }, content: `<p>Delete <strong>${esc(s.name)}</strong> and everything recorded in it? This can't be undone from the ledger (its file stays on disk, and an export can bring it back with Import).</p><p>Its archived chat stays on the server, but the ledger can't open it any more.</p>` });
-    if (!ok) return;
+    const hasChat = archivesOf(s.id).length > 0;
+    const choice = await foundry.applications.api.DialogV2.wait({
+      window: { title: "Delete session" },
+      content: `<p>Delete <strong>${esc(s.name)}</strong> and everything recorded in it? This can't be undone from the ledger (its file stays on disk, and an export can bring it back with Import).</p>${hasChat ? `<p>Its archived chat stays on the server. The archive window lists it under Deleted sessions unless you take it off.</p><label class="pcl-check"><input type="checkbox" name="chat"> Take its archived chat off the list too</label>` : ""}`,
+      buttons: [
+        { action: "delete", label: "Delete", icon: "fa-solid fa-trash", callback: (ev, button) => ({ chat: !!button.form.elements.chat?.checked }) },
+        { action: "cancel", label: "Cancel", default: true },
+      ],
+      rejectClose: false,
+    });
+    if (!choice || choice === "cancel") return;
+    if (choice.chat) await forgetArchives(s.id);
     await Store.mutateIndex((ix) => {
       ix.sessions = ix.sessions.filter((x) => x.id !== s.id);
       if (ix.active === s.id) {
@@ -2724,7 +3083,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!game.user.isGM) return;
     const file = await foundry.applications.api.DialogV2.prompt({
       window: { title: "Import a Campaign Ledger export" },
-      content: `<p>Pick a file made by "Export everything". Sessions and arcs it holds are added; ones already in the ledger get any events they're missing. Nothing is deleted.</p><input type="file" name="file" accept=".json,application/json">`,
+      content: `<p>Pick a file made by "Export everything". Sessions and arcs it holds are added; ones already in the ledger get any events they're missing. Nothing is deleted.</p><label class="pcl-check">Export file <input type="file" name="file" accept=".json,application/json"></label>`,
       ok: { label: "Import", callback: (ev, button) => button.form.elements.file.files[0] ?? null },
     });
     if (!file) return;
@@ -2742,7 +3101,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!game.user.isGM) return;
     const ok = await foundry.applications.api.DialogV2.confirm({
       window: { title: "Reset Campaign Ledger" },
-      content: "<p>This clears every session, arc and encounter from the ledger. A full export downloads first; Import brings it back.</p><p>Archived chat isn't in the export: it stays on the server, but the ledger can't open it any more.</p><p>Reset the ledger?</p>",
+      content: "<p>This clears every session, arc and encounter from the ledger. A full export downloads first; Import brings it back.</p><p>Archived chat isn't in the export: it stays on the server, and the archive window lists it under Deleted sessions.</p><p>Reset the ledger?</p>",
     });
     if (!ok) return;
     await LedgerApp.#onExport.call(this);
@@ -2769,11 +3128,64 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, {
     if (!s || !n) return;
     const ok = await foundry.applications.api.DialogV2.confirm({
       window: { title: "Archive chat" },
-      content: `<p>Copy the chat log (${n} message${n === 1 ? "" : "s"}) into the ledger with <strong>${esc(s.name)}</strong> and clear it from chat? The archive opens from the speech bubbles on the Sessions tab.</p>`,
+      content: `<p>Copy the chat log (${n} message${n === 1 ? "" : "s"}${archivesOf(s.id).length ? " since the last archive" : ""}) into the ledger with <strong>${esc(s.name)}</strong> and clear it from chat? The archive opens from the speech bubbles on the Sessions tab.</p>`,
     });
     if (!ok) return;
     await Store.flushNow();
     await archiveChat(s.id, { clear: true });
+    this.render();
+  }
+
+  static #onExportStats(event, target) {
+    exportStats(target.dataset.id);
+  }
+
+  /** The GM puts right who an entry credits (or deletes it), for when the automatic attribution got it wrong. */
+  static async #onCorrectEntry(event, target) {
+    event.stopPropagation();
+    if (!game.user.isGM) return;
+    const { eid, sid } = target.dataset;
+    const why = sid === Store.index.active ? await notRecording() : null;
+    if (why) return ui.notifications.warn(safe`Campaign Ledger: ${why}. Correct the entry there.`);
+    const data = await Store.load(sid);
+    const ev = data.events.find((e) => e.id === eid);
+    if (!ev) return;
+    // Taken, down, healed and up belong to who they happened to; what can be wrong is who gets the credit (by)
+    const field = ["taken", "down", "healed", "up"].includes(ev.k) ? "by" : "a";
+    const people = new Map();
+    for (const e of data.events) for (const w of [e.a, e.tg, e.by, e.v]) if (typeof w?.k === "string" && w.n) people.set(w.k, w);
+    const list = [...people.values()].sort((x, y) => (y.p ? 1 : 0) - (x.p ? 1 : 0) || x.n.localeCompare(y.n));
+    const cur = ev[field]?.k ?? "";
+    // Credit can go to nobody; so can a kill, or damage and healing dealt, which may have no one behind them
+    const nobody = field === "by" || ["kill", "dealt", "healdone"].includes(ev.k);
+    const opts = `${nobody ? `<option value=""${cur ? "" : " selected"}>Nobody</option>` : ""}${list.map((w) => `<option value="${esc(w.k)}"${w.k === cur ? " selected" : ""}>${esc(w.n)}${w.p ? "" : " (foe)"}</option>`).join("")}`;
+    const choice = await foundry.applications.api.DialogV2.wait({
+      window: { title: "Correct an entry" },
+      content: `<p>${describe(ev) ?? esc(ev.k)}</p><label class="pcl-check">${field === "by" ? "Credit to" : "Who did it"} <select name="who">${opts}</select></label>`,
+      buttons: [
+        { action: "save", label: "Save", icon: "fa-solid fa-check", default: true, callback: (e, button) => ({ who: button.form.elements.who.value }) },
+        { action: "delete", label: "Delete entry", icon: "fa-solid fa-trash" },
+        { action: "cancel", label: "Cancel" },
+      ],
+      rejectClose: false,
+    });
+    if (!choice || choice === "cancel") return;
+    const live = (await Store.load(sid)).events;
+    const target2 = live.find((e) => e.id === eid);
+    if (!target2) return;
+    if (choice === "delete") {
+      Store.drop(sid, [target2]);
+      live.splice(live.indexOf(target2), 1);
+    } else {
+      const w = choice.who ? people.get(choice.who) : null;
+      if (!w && !nobody) return;
+      target2[field] = w ? { k: w.k, n: w.n, p: !!w.p } : null;
+    }
+    Store.dirty.add(sid);
+    Store.fixes++;
+    summaries.delete(sid);
+    if (await Store.save(sid)) announceSaved([sid]);
+    Store.rev++;
     this.render();
   }
 
@@ -2804,6 +3216,28 @@ class LedgerMenu extends foundry.applications.api.ApplicationV2 {
 }
 
 /* ------------------------------------------------------------------ */
+/* API                                                                */
+/* ------------------------------------------------------------------ */
+
+/** The sessions, oldest first: [{ id, name, arc, arcName, start, end, running }]. A copy; changing it changes nothing. */
+function sessions() {
+  const ix = Store.index;
+  return ix.sessions.map((s) => ({ id: s.id, name: s.name, arc: s.arc ?? null, arcName: ix.arcs.find((a) => a.id === s.arc)?.name ?? null, start: s.start, end: s.end ?? null, running: s.id === ix.active }));
+}
+
+/**
+ * Totals per character and creature for a scope ("all", "session:<id>", "arc:<id>", "arc:none"), as the ledger's
+ * tables count them: [{ k, n, p, ally, atk, hit, crit, dealt, ff, taken, kills, ... }]. Players get the party only,
+ * and only when the GM lets them open the ledger.
+ */
+async function stats(scope = "all") {
+  if (!game.user.isGM && !game.settings.get(MOD, "playerView")) return [];
+  const data = await Store.loadScope(scope);
+  const rows = [...aggregate(data.events).values()].filter((r) => game.user.isGM || r.p);
+  return rows.map((r) => ({ ...foundry.utils.deepClone({ ...r, encounters: undefined }), encounters: r.encounters.size, ally: isAlly(r) }));
+}
+
+/* ------------------------------------------------------------------ */
 /* Registration                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -2817,6 +3251,17 @@ function onSocket(msg, senderId) {
         if (leading && !tabs.isLead()) loseLead().catch((e) => console.error(MOD, e));
       }, 2500);
     }
+    return;
+  }
+  if (msg?.type === "saved" && Array.isArray(msg.ids) && game.users.get(senderId)?.isGM) {
+    // Another client saved session files: read them again. The recording client keeps the running session and anything
+    // it hasn't saved yet; a correction from another client to an ended session is read again.
+    for (const id of msg.ids) {
+      if (typeof id !== "string") continue;
+      if (game.user.isGM && leading && (id === Store.index.active || Store.dirty.has(id))) continue;
+      Store.forget(id);
+    }
+    refreshOpenApps();
     return;
   }
   if (msg?.type === "revert" && typeof msg.m === "string" && msg.m.length <= 32 && leading) {
@@ -2861,6 +3306,11 @@ Hooks.once("init", () => {
     scope: "world", config: true, type: Boolean, default: true,
     onChange: () => { refreshOpenApps(); ChatArchiveApp.refresh(); },
   });
+  game.settings.register(MOD, "needPlayer", {
+    name: "Start a session only when a player is logged in",
+    hint: "Rolls the GM makes alone (prep between sessions) don't start a new session. New session in the ledger starts one at any time.",
+    scope: "world", config: true, type: Boolean, default: true,
+  });
   game.settings.register(MOD, "sessionGap", {
     name: "Hours between sessions",
     hint: "A session nobody ended is ended by itself when the next roll comes this many hours after its last one, and a new session starts. 0 turns this off.",
@@ -2872,7 +3322,7 @@ Hooks.once("init", () => {
 });
 
 Hooks.once("ready", () => {
-  game.modules.get(MOD).api = { open: () => LedgerApp.open(), startSession, endSession, resumeSession, importLedger, Store, aggregate, archiveChat, archivesOf, publicArchivesOf, rebuildChatIndex, viewChat: (id) => ChatArchiveApp.open(id) };
+  game.modules.get(MOD).api = { open: () => LedgerApp.open(), startSession, endSession, resumeSession, importLedger, sessions, stats, archiveChat, archivesOf, publicArchivesOf, rebuildChatIndex, viewChat: (id) => ChatArchiveApp.open(id) };
   lastActive = Store.index.active;
   primeCaches();
   // The socket handler before start(), so no answer from another tab is missed.
@@ -2880,6 +3330,10 @@ Hooks.once("ready", () => {
   tabs.start();
   // A page being frozen (a background tab) hands its last events over and stops recording
   document.addEventListener("freeze", () => loseLead().catch((e) => console.error(MOD, e)));
+  // Leaving the page: try to save what's waiting (it may not finish; at most half a minute is lost)
+  globalThis.addEventListener("pagehide", () => {
+    if (leading) Store.flushNow().catch(() => {});
+  });
   // A player's Revert on a card they can't mark: tell the recording GM which card it was
   document.addEventListener("click", (event) => {
     const button = event.target?.closest?.('button[data-action="revertDamage"]');
@@ -2901,6 +3355,7 @@ Hooks.on("updateActor", (a, c, o, userId) => onUpdateActor(a, c, o, userId).catc
 Hooks.on("createItem", (i) => onDying(i).catch((e) => console.error(MOD, e)));
 Hooks.on("updateItem", (i, c) => onDying(i, c ?? {}).catch((e) => console.error(MOD, e)));
 Hooks.on("deleteItem", (i) => onDeleteItem(i));
+Hooks.on("createActiveEffect", (e) => onDeadStatus(e).catch((err) => console.error(MOD, err)));
 Hooks.on("combatStart", (c) => onCombatStart(c).catch((e) => console.error(MOD, e)));
 Hooks.on("updateCombat", (c, ch) => onUpdateCombat(c, ch).catch((e) => console.error(MOD, e)));
 Hooks.on("createCombatant", (c) => onCreateCombatant(c).catch((e) => console.error(MOD, e)));
@@ -2942,6 +3397,7 @@ Hooks.on("getSceneControlButtons", (controls) => {
     order: Object.keys(tools).length,
     button: true,
     visible: true,
-    onChange: () => LedgerApp.open(),
+    // Opened by a click, so the keys go to the ledger at once
+    onChange: () => LedgerApp.open()?.then?.((app) => app?.focusWindow?.()).catch?.((e) => console.error(MOD, e)),
   };
 });

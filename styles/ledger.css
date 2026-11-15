@@ -18,8 +18,8 @@
 .pcl-app .pcl .pcl-idle { opacity: 0.7; font-style: italic; }
 
 .pcl-app .pcl-tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--color-border, #7a7971); }
-.pcl-app .pcl .pcl-tabs a { padding: 6px 12px; border-bottom: 2px solid transparent; opacity: 0.75; background: none; }
-.pcl-app .pcl .pcl-tabs a.active { border-bottom-color: var(--color-text-hyperlink, #ff6400); opacity: 1; font-weight: 600; }
+.pcl-app .pcl .pcl-tabs button { flex: 0 0 auto; width: auto; margin: 0; padding: 6px 12px; border: none; border-bottom: 2px solid transparent; border-radius: 0; opacity: 0.75; background: none; color: inherit; font: inherit; line-height: normal; box-shadow: none; }
+.pcl-app .pcl .pcl-tabs button.active { border-bottom-color: var(--color-text-hyperlink, #ff6400); opacity: 1; font-weight: 600; }
 
 .pcl-app .pcl-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 16px; }
 .pcl-app .pcl-body h3 { margin: 14px 0 6px; font-size: 14px; border-bottom: 1px solid rgba(127, 127, 127, 0.35); }
@@ -31,12 +31,12 @@
 .pcl-app .pcl-table th { font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--color-bg, rgba(30, 30, 30, 0.95)); z-index: 1; }
 .pcl-app .pcl-table td.pcl-name, .pcl-app .pcl-table th:first-child { text-align: left; }
 .pcl-app .pcl-table tbody tr:hover { background: rgba(255, 255, 255, 0.05); }
-.pcl-app .pcl-party th[data-action] { cursor: pointer; }
 .pcl-app .pcl-party th.pcl-group { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; border-bottom: none; }
+.pcl-app .pcl-party tr.pcl-subhead th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.75; padding-top: 8px; cursor: default; }
 .pcl-app .pcl-lead { font-weight: 700; color: var(--color-text-hyperlink, #ff6400); }
 .pcl-app .pcl-click { cursor: pointer; }
-.pcl-app .pcl-enc td.pcl-name a { opacity: 0.5; margin-left: 4px; }
-.pcl-app .pcl-enc td.pcl-name a:hover { opacity: 1; }
+.pcl-app .pcl-enc td.pcl-name button.pcl-icon { opacity: 0.5; margin-left: 4px; }
+.pcl-app .pcl-enc td.pcl-name button.pcl-icon:hover, .pcl-app .pcl-enc td.pcl-name button.pcl-icon:focus-visible { opacity: 1; }
 .pcl-app .pcl-detail > td { padding: 6px 12px 12px; background: rgba(0, 0, 0, 0.12); }
 .pcl-app .pcl-foe td { opacity: 0.8; font-style: italic; }
 .pcl-app .pcl-table input[type="text"] { width: 100%; min-width: 160px; }
@@ -68,9 +68,9 @@
 /* Dice */
 .pcl-app .pcl-dice { display: grid; grid-template-columns: 200px 1fr; gap: 16px; align-items: start; }
 .pcl-app .pcl-dice-list { display: flex; flex-direction: column; gap: 2px; border-right: 1px solid rgba(127, 127, 127, 0.25); padding-right: 8px; }
-.pcl-app .pcl .pcl-dice-list a { padding: 4px 8px; border-radius: 4px; opacity: 0.8; }
-.pcl-app .pcl .pcl-dice-list a:hover { background: rgba(255, 255, 255, 0.06); opacity: 1; }
-.pcl-app .pcl .pcl-dice-list a.active { background: rgba(255, 255, 255, 0.1); opacity: 1; font-weight: 600; }
+.pcl-app .pcl .pcl-dice-list button { display: block; width: 100%; text-align: left; border: none; background: none; color: inherit; font: inherit; line-height: normal; box-shadow: none; margin: 0; padding: 4px 8px; border-radius: 4px; opacity: 0.8; }
+.pcl-app .pcl .pcl-dice-list button:hover { background: rgba(255, 255, 255, 0.06); opacity: 1; }
+.pcl-app .pcl .pcl-dice-list button.active { background: rgba(255, 255, 255, 0.1); opacity: 1; font-weight: 600; }
 .pcl-app .pcl-dice-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .pcl-app .pcl-dice-top strong { font-size: 15px; }
 .pcl-app .pcl-tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
@@ -110,3 +110,17 @@
 .pcl-app .pcl-archive-log .message-header .whisper-to { flex: 0 0 100%; font-size: 12px; opacity: 0.8; }
 .pcl-app .pcl-more { margin: 10px auto 0; display: block; width: auto; padding: 0 12px; line-height: 26px; }
 .pcl-check { display: flex; gap: 6px; align-items: center; margin: 8px 0 0; }
+.pcl-app .pcl-trends { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-bottom: 8px; }
+.pcl-app .pcl-trend { flex: 0 0 240px; width: 240px; margin: 0; padding: 0; }
+.pcl-app .pcl-trend figcaption { font-size: 12px; opacity: 0.85; margin: 0 0 2px; text-align: left; }
+.pcl-app .pcl-trend svg { display: block; overflow: visible; }
+.pcl-app .pcl-trend-line { fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.pcl-app .pcl-trend-base { stroke: currentColor; stroke-width: 1; opacity: 0.25; }
+.pcl-app .pcl-trend-dot { fill: currentColor; stroke: transparent; stroke-width: 10; paint-order: stroke; }
+.pcl-app td.pcl-present { font-size: 12px; max-width: 220px; }
+.pcl-app .pcl-fix { margin-left: 4px; opacity: 0.35; }
+.pcl-app li:hover > .pcl-fix, .pcl-app .pcl-fix:focus-visible { opacity: 0.8; }
+.pcl-app .pcl button.pcl-icon, .pcl-app .pcl button.pcl-sort, .pcl-app .pcl button.pcl-rowbtn { display: inline; width: auto; height: auto; min-height: 0; margin: 0; padding: 0 2px; border: none; background: none; color: inherit; font: inherit; line-height: inherit; box-shadow: none; cursor: pointer; }
+.pcl-app .pcl button.pcl-sort { font-weight: inherit; text-transform: inherit; letter-spacing: inherit; }
+.pcl-app .pcl button.pcl-icon:hover, .pcl-app .pcl button.pcl-sort:hover { text-shadow: 0 0 6px var(--color-shadow-primary, #ff6400); }
+.pcl-app .pcl button:not(:focus-visible) { outline: none; }

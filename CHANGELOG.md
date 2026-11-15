@@ -1,7 +1,28 @@
 # Changelog
 
-## 1.1.1
+## 1.2.0
 
+Everything from the code review in one release (1.1.1 was never released and is folded in here).
+
+- Companions, familiars, summons and NPCs on the party's side are shown in their own group, Allies and companions, under the characters, still counted with the party.
+- Friendly fire: damage dealt to your own side is counted apart, with its own column and a line in the recap. Damage a creature does to itself counts for nobody, in older sessions too.
+- Luck on the Dice tab is judged by the number of rolls: About average, Running hot or Running cold, or the difference.
+- Damage and healing applied by hand show in the round-by-round log.
+- The GM can correct any line of the round log: credit it to someone else, or delete it.
+- The Sessions tab shows who was there, and with two sessions or more, small charts of the party's hit rate, damage dealt and taken and times downed per session.
+- Save a session's numbers as Markdown (the page icon on the Sessions tab), to go beside a recap.
+- The recap adds who was there, and with the author's other modules on, clues found, money spent and earned at the market, and people met.
+- A session no longer starts on the GM's own rolls with no player logged in (new setting, on by default).
+- A session that ended by itself has its recap whispered to the GM.
+- A party member marked dead without Dying reaching its maximum is recorded as a death, once.
+- Deleting a session can take its archived chat off the list; otherwise it shows under Deleted sessions in the archive window.
+- The archive prompt says how many messages came since the last archive.
+- The ledger opens on the running session.
+- Keyboard: every control is a button or field with a name; Tab, the arrow keys between tabs, and once you've clicked in the ledger, Space and the arrows stay with it.
+- Sessions save every 30 seconds and at the end of each round, and players' ledgers update without the session list being rewritten each time.
+- A Target Helper update with no saves no longer starts a session.
+- API: `sessions()` and `stats(scope)` replace `Store` and `aggregate`. See the guide.
+- README shortened; details moved to docs/guide.md.
 - One GM with the world open in two browser tabs no longer records twice: only one tab records, and when another tab takes over, what each recorded is kept. Recaps and notices aren't posted twice.
 - A player's Revert on a damage card someone else posted is now taken back too: Foundry doesn't let them mark the card, so their client tells the recording GM which card it was.
 - Revert also takes back the Dying and death the card caused.
