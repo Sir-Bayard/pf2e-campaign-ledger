@@ -41,7 +41,7 @@ https://github.com/Sir-Bayard/pf2e-campaign-ledger/releases/latest/download/modu
 
 Foundry's **Update** button then picks up each new release. You can also download `module.zip` from the [latest release](https://github.com/Sir-Bayard/pf2e-campaign-ledger/releases/latest) and unzip it into `Data/modules/pf2e-campaign-ledger`.
 
-Requires Foundry VTT 14 (verified on 14.369) and the Pathfinder 2e system 8.0.0 or later.
+Requires Foundry VTT 14 (verified on 14.370) and the Pathfinder 2e system 8.0.0 or later.
 
 If you used PF2e Campaign Statistics, turn it off so rolls aren't recorded twice. Its journal can stay; the ledger doesn't read it.
 
@@ -113,16 +113,16 @@ Turn off "Record statistics" in the module settings for test rolls or a one-shot
 
 - **Damage is damage dealt**: what came off HP and temporary HP when damage was applied from a chat card, after resistances, not counting overkill. The amount rolled is shown alongside it. Healing works the same way.
 - Damage taken is what actually came off a character's HP, however it was applied, plus any temporary HP that went with the same hit. Temporary HP cleared on its own isn't damage, and HP that rises together with the maximum (a level, a rest that raised it) isn't healing.
-- Kills, downs and revives are credited to whoever applied the damage or healing. If HP was changed by hand, they go to whoever last hit (a hit, not a miss) or healed that creature in the past minute; failing that, to the creature whose turn it is when it's on the other side (the same side, for healing). Otherwise they're left unattributed.
-- The Revert button on a damage or healing card takes back everything recorded for that card, including a kill, down or revive it caused, and the undo isn't counted as healing or damage. Use it from the GM's client or the client of whoever applied the damage: Foundry doesn't let anyone else change the card, so the ledger never hears of the revert. Dying and deaths stay as PF2e leaves them; remove the condition by hand if it shouldn't be there.
+- Kills, downs and revives are credited to whoever applied the damage or healing. If HP was changed by hand, they go to whoever last hit (a hit, not a miss) or healed that creature in the past minute; failing that, to the creature whose turn it is when it's on the other side (the same side, for healing). Otherwise they're left unattributed. Damage a creature does to itself (persistent damage, a backfiring ability) goes to whoever put that persistent damage on it, else to whoever last hit it in the past minute.
+- The Revert button on a damage or healing card takes back everything recorded for that card, including a kill, down, revive, Dying or death it caused, and the undo isn't counted as healing or damage. A player can't mark a card someone else posted as reverted, so when a player reverts one, their client tells the recording GM which card it was. PF2e leaves the Dying condition in place; remove it by hand if it shouldn't be there.
 - Hit % and save % only count rolls with a known result. A strike with no target, or a save with no DC, still counts as a roll but not toward the percentage.
 - Saves rolled from PF2e Toolbelt's Target Helper (the save bar on spell and damage cards) are recorded, and a reroll there replaces the earlier result.
 - Actions and feats count when their card is posted to chat. The same character using the same ability within 5 seconds counts once.
 - Spells, skills and abilities count as contributions alongside attacks. "Saves forced" credits a spell or ability's user with the saves it forced on the other side, shown as failed / rolled. This works for saves rolled from a spell or damage card, including Target Helper; a save rolled from the sheet with no card doesn't say who forced it. "Skills" is skill checks that succeeded / skill checks against a DC, with initiative left out. Sessions before 0.3.2 have no saves forced.
 - **Dice**: every d20 counts, including the first roll of a reroll. Fortune and misfortune rolls (roll twice, keep one) are left out of the Dice tab because they skew the curve. Luck is the average roll minus 10.5.
 - Enemies are recorded by token name, so give them names your players are allowed to see. When no token can be found, the prototype token's name is used; the actor's own name never is. NPCs whose alliance is "party" (hirelings, allies) count on the party's side.
-- Hero Points count as spent when one goes down and a reroll follows within 10 seconds (or all at once while dying, to stabilise). Any other decrease, such as a reset by the GM or by Workbench's Hero Point Handler, is kept as lost and not counted.
-- Only the GM's client records. If no GM is logged in, nothing is recorded.
+- Hero Points count as spent when one goes down and a reroll follows within 10 seconds (or all at once while dying, to stabilize). Any other decrease, such as a reset by the GM or by Workbench's Hero Point Handler, is kept as lost and not counted.
+- Only the GM's client records, and only one tab of it if the GM has the world open twice; when another tab takes over, what each recorded is kept. If no GM is logged in, nothing is recorded.
 - Sessions recorded before 0.3.0 have no damage dealt, since that wasn't recorded yet. Their rolled damage is still there.
 
 ## Macros

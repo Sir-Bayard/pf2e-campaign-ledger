@@ -8,6 +8,11 @@
  * Archived chat goes into its own files there too, listed on a GM-only journal entry (see "Chat archive").
  */
 
+import { gmTabs } from "./kit/gm-tabs.mjs";
+import { esc, safe } from "./kit/safe-text.mjs";
+import { singleWindow } from "./kit/single-window.mjs";
+import { rememberWindow } from "./kit/window-memory.mjs";
+
 const MOD = "pf2e-campaign-ledger";
 const OUTCOMES = ["criticalFailure", "failure", "success", "criticalSuccess"];
 const SAVES = ["fortitude", "reflex", "will"];
@@ -21,12 +26,63 @@ const FP = () => foundry.applications.apps.FilePicker.implementation;
 const now = () => Date.now();
 const uid = () => foundry.utils.randomID(10);
 const fileDir = () => `worlds/${game.world.id}/${MOD}`;
-const isRecorder = () => game.user.isGM && game.users.activeGM?.id === game.user.id;
-const recording = () => game.settings.get(MOD, "recording");
+const tabs = gmTabs(MOD);
+let leading = false;
 
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+/**
+ * True in the one client that records: the active GM's lead tab (a second tab of the same GM records nothing). A tab
+ * that has just taken the lead drops what it had read, since the tab that led before wrote the files since.
+ */
+async function isRecorder() {
+  const lead = await tabs.leadNow();
+  if (!lead && leading) await loseLead();
+  const took = lead && !leading;
+  leading = lead;
+  if (took) {
+    Store.cache.clear();
+    await resumeEncounter();
+  }
+  return lead;
 }
+
+/**
+ * This tab stopped recording (another tab of the same GM took over, or the page is being frozen): its last events go
+ * into the file now, merged with whatever the other tab saved, and its copies are dropped, since the other tab writes
+ * the files from here on.
+ */
+async function loseLead() {
+  if (!leading) return;
+  leading = false;
+  clearTimeout(Store.timer);
+  Store.firstPending = 0;
+  const ids = [...Store.cache.keys()];
+  try {
+    for (const id of ids) if (Store.dirty.has(id)) await Store.save(id, { force: true });
+  } finally {
+    Store.cache.clear();
+  }
+}
+
+/**
+ * Why this GM client mustn't change the running session's file (the recording client would save over it), or null
+ * when it may.
+ */
+async function notRecording() {
+  if (await tabs.leadNow()) return null;
+  return game.users.activeGM?.isSelf ? "another tab of yours is recording" : `${game.users.activeGM?.name ?? "another GM"} is recording`;
+}
+
+/** A combat already running when this tab starts recording (a reload, a hand-over) keeps its encounter. */
+async function resumeEncounter() {
+  let enc = null;
+  if (game.combat?.started) {
+    const s = await activeSession({ create: false });
+    const data = s ? await Store.load(s.id) : null;
+    if (data?.encounters.some((e) => e.id === game.combat.id && !e.end)) enc = game.combat.id;
+  }
+  Rec.encounter = enc;
+}
+const recording = () => game.settings.get(MOD, "recording");
 
 function degree(outcome) {
   const i = OUTCOMES.indexOf(outcome);
@@ -111,7 +167,37 @@ function actorFromUuid(uuid) {
 /* Store                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Adds to `data` what `disk` (the same session as saved on the server) has and `data` lacks: events by id and
+ * encounters by id; what `data` has wins. Events taken back by either copy (`dropped` here, `disk.dropped` there)
+ * stay out of both, and the list of them is kept in the file so a later merge doesn't bring them back either.
+ */
+/** The id an event from before 1.1.1 (which has none) gets from its content: the same on every read. */
+function contentId(e) {
+  const text = JSON.stringify(e);
+  return `h${hashOf(text)}${hashOf(`~${text}`)}`;
+}
+
+function mergeInto(data, disk, dropped = null) {
+  const gone = new Set([...(dropped ?? []), ...(Array.isArray(data.dropped) ? data.dropped : []), ...(Array.isArray(disk.dropped) ? disk.dropped : [])]);
+  if (gone.size) {
+    data.events = data.events.filter((e) => !gone.has(e.id));
+    data.dropped = [...gone];
+  }
+  const have = new Set(data.events.map((e) => e.id));
+  let added = false;
+  for (const e of disk.events) {
+    if (have.has(e.id) || gone.has(e.id)) continue;
+    data.events.push(e);
+    added = true;
+  }
+  if (added) data.events.sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+  for (const enc of disk.encounters) if (enc?.id && !data.encounters.some((x) => x.id === enc.id)) data.encounters.push(enc);
+}
+
 const DEFAULT_INDEX = { version: 1, arcs: [], sessions: [], active: null, currentArc: null, updated: 0 };
+/** Returned by a mutateIndex change that turns out to have nothing to write. */
+const SKIP = Symbol("skip");
 
 const Store = {
   cache: new Map(),
@@ -123,17 +209,20 @@ const Store = {
     return foundry.utils.mergeObject(foundry.utils.deepClone(DEFAULT_INDEX), game.settings.get(MOD, "index") ?? {});
   },
 
-  async setIndex(ix) {
-    return this.mutateIndex(() => ix);
-  },
-
-  // Index writes run one at a time; fn gets the index as it is once the write before it has landed
+  /**
+   * Every change to the index goes through here, one at a time: fn gets the index as it is once the write before it
+   * has landed and changes it in place, so two changes at once can't undo each other. Resolves to what fn returns;
+   * fn returning SKIP writes nothing.
+   */
   indexChain: Promise.resolve(),
   mutateIndex(fn) {
     const run = this.indexChain.then(async () => {
-      const ix = fn(this.index) ?? this.index;
+      const ix = this.index;
+      const out = fn(ix);
+      if (out === SKIP) return undefined;
       ix.updated = now();
       await game.settings.set(MOD, "index", ix);
+      return out;
     });
     this.indexChain = run.catch((e) => console.error(MOD, e));
     return run;
@@ -148,27 +237,62 @@ const Store = {
     return `${fileDir()}/${this.file(id)}`;
   },
 
+  /**
+   * The session file as it is on the server: { events, encounters }, or null when it hasn't been saved yet. Throws on
+   * anything else (server down, a half-written file), so an unread file is never taken for an empty one. Events from
+   * before 1.1.1 have no id; they get one from their content, the same each time, so two copies of the file agree.
+   */
+  async readFile(id) {
+    const res = await fetch(`${this.path(id)}?t=${now()}`, { cache: "no-store" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      throw new Error(`${this.file(id)} is unreadable: ${e.message}`);
+    }
+    data.events = Array.isArray(data?.events) ? data.events : [];
+    data.encounters = Array.isArray(data?.encounters) ? data.encounters : [];
+    for (const e of data.events) if (e && typeof e === "object") e.id ??= contentId(e);
+    data.events = data.events.filter((e) => e && typeof e === "object");
+    return data;
+  },
+
+  // Loads in flight, so two events at once on a session not read yet share one read (and one copy)
+  loading: new Map(),
   async load(id) {
     if (this.cache.has(id)) return this.cache.get(id);
-    let data = { id, events: [], encounters: [] };
-    // Only a clean read (the file, or a 404 for a session that hasn't been saved yet) is cached. Anything else
-    // (server down, a half-written file) would be cached as an empty session and the next save would overwrite
-    // the real one.
-    const fail = (why) => {
-      if (!this.readFailed++) ui.notifications?.error(`Campaign Ledger: couldn't read the session file (${why}). Nothing is recorded until it can be read, so the file isn't overwritten.`, { permanent: true });
-      throw new Error(`Campaign Ledger: couldn't read session ${id} (${why})`);
-    };
-    const res = await fetch(`${this.path(id)}?t=${now()}`, { cache: "no-store" }).catch((e) => fail(e.message));
-    if (res.ok) {
-      try { data = await res.json(); } catch (e) { fail(`${this.file(id)} is unreadable: ${e.message}`); }
-    } else if (res.status !== 404) {
-      fail(`HTTP ${res.status}`);
+    if (this.loading.has(id)) return this.loading.get(id);
+    const run = (async () => {
+      let disk;
+      try {
+        disk = await this.readFile(id);
+      } catch (e) {
+        if (!this.readFailed++) ui.notifications.error(safe`Campaign Ledger: couldn't read the session file (${e.message}). Nothing is recorded until it can be read, so the file isn't overwritten.`, { permanent: true });
+        throw new Error(`Campaign Ledger: couldn't read session ${id} (${e.message})`);
+      }
+      this.readFailed = 0;
+      const data = { ...(disk ?? {}), id, events: disk?.events ?? [], encounters: disk?.encounters ?? [] };
+      if (!this.cache.has(id)) this.cache.set(id, data);
+      return this.cache.get(id);
+    })();
+    this.loading.set(id, run);
+    try {
+      return await run;
+    } finally {
+      this.loading.delete(id);
     }
-    this.readFailed = 0;
-    data.events ??= [];
-    data.encounters ??= [];
-    this.cache.set(id, data);
-    return data;
+  },
+
+  // Event ids taken back (Revert) per session, so a merge with the file doesn't bring them back
+  dropped: new Map(),
+  drop(id, events) {
+    const set = this.dropped.get(id) ?? new Set();
+    for (const e of events) if (e.id) set.add(e.id);
+    this.dropped.set(id, set);
+    const data = this.cache.get(id);
+    if (data) data.dropped = [...new Set([...(Array.isArray(data.dropped) ? data.dropped : []), ...set])];
   },
 
   forget(id) {
@@ -187,13 +311,26 @@ const Store = {
 
   failed: 0,
   readFailed: 0,
-  async save(id) {
+  dirty: new Set(), // sessions with changes not saved yet
+
+  /**
+   * Upload a session's file. Only the recording client writes the running session: another GM tab, or another GM,
+   * may hold an older copy (`force` is for a tab handing over its last events). Whatever another tab saved since this
+   * copy was read (a hand-over between tabs) is kept: events and encounters this copy lacks are added from the file,
+   * except events taken back here. Returns true when saved.
+   */
+  async save(id, { force = false } = {}) {
     const data = this.cache.get(id);
-    if (!data) return;
+    if (!data) return false;
+    if (!force && id === this.index.active && !tabs.isLead()) return false;
+    // Off the list now: an event recorded while this save is under way puts it back, so it's saved next time
+    this.dirty.delete(id);
     await this.ensureDir();
-    const file = new File([JSON.stringify(data)], this.file(id), { type: "application/json" });
     let ok = false;
     try {
+      const disk = await this.readFile(id);
+      if (disk) mergeInto(data, disk, this.dropped.get(id));
+      const file = new File([JSON.stringify(data)], this.file(id), { type: "application/json" });
       const res = await FP().upload("data", fileDir(), file, {}, { notify: false });
       ok = !!res && res !== false;
     } catch (e) {
@@ -201,38 +338,44 @@ const Store = {
     }
     if (!ok) {
       // Keep the data in memory and tell the GM once; the next event schedules another try
-      if (!this.failed++) ui.notifications?.error("Campaign Ledger: couldn't save the session file. Events are kept in memory; it will try again after the next roll. Check the server's Data/worlds folder.", { permanent: true });
-    } else if (this.failed) {
-      this.failed = 0;
-      ui.notifications?.info("Campaign Ledger: the session file saved.");
+      this.dirty.add(id);
+      if (!this.failed++) ui.notifications.error("Campaign Ledger: couldn't save the session file. Events are kept in memory; it will try again after the next roll. Check the server's Data/worlds folder.", { permanent: true });
+    } else {
+      if (this.failed) {
+        this.failed = 0;
+        ui.notifications.info("Campaign Ledger: the session file saved.");
+      }
     }
+    return ok;
   },
 
   // Save 4 seconds after the last event, but never wait more than 20 seconds during a busy fight.
   firstPending: 0,
   scheduleSave(id) {
+    this.dirty.add(id);
     clearTimeout(this.timer);
     this.firstPending ||= now();
     const wait = Math.max(0, Math.min(4000, this.firstPending + 20000 - now()));
     this.timer = setTimeout(async () => {
       this.firstPending = 0;
-      await this.save(id);
-      await this.mutateIndex((ix) => ix);
+      // Another tab took over meanwhile (or this one was frozen): hand over instead
+      if (leading && !tabs.isLead()) return loseLead();
+      for (const d of [...this.dirty]) await this.save(d);
+      await this.mutateIndex(() => null);
     }, wait);
   },
 
   async flushNow() {
     clearTimeout(this.timer);
     this.firstPending = 0;
-    const id = this.index.active;
-    if (id && this.cache.has(id)) await this.save(id);
+    for (const id of [...this.dirty]) if (this.cache.has(id)) await this.save(id);
   },
 
   async loadScope(scope) {
     const ix = this.index;
     let sessions = ix.sessions;
-    if (scope?.startsWith("arc:")) sessions = sessions.filter((s) => s.arc === scope.slice(4));
-    else if (scope === "arc:none") sessions = sessions.filter((s) => !s.arc);
+    if (scope === "arc:none") sessions = sessions.filter((s) => !s.arc);
+    else if (scope?.startsWith("arc:")) sessions = sessions.filter((s) => s.arc === scope.slice(4));
     else if (scope?.startsWith("session:")) sessions = sessions.filter((s) => s.id === scope.slice(8));
     const datas = await Promise.all(sessions.map((s) => this.load(s.id)));
     return {
@@ -260,14 +403,21 @@ async function activeSession({ create = true } = {}) {
   if (s || !create) return s ?? null;
   if (starting) return starting;
   starting = (async () => {
-    const fresh = Store.index;
-    const session = { id: uid(), name: `Session ${fresh.sessions.length + 1}`, arc: fresh.currentArc ?? null, start: now(), end: null };
-    fresh.sessions.push(session);
-    fresh.active = session.id;
-    await Store.setIndex(fresh);
+    let running = null;
+    const made = await Store.mutateIndex((ix) => {
+      // A session made running meanwhile (Resume, or another client) is the one to record into
+      running = ix.sessions.find((x) => x.id === ix.active) ?? null;
+      if (running) return SKIP;
+      const fresh = { id: uid(), name: nextSessionName(ix), arc: ix.currentArc ?? null, start: now(), end: null };
+      ix.sessions.push(fresh);
+      ix.active = fresh.id;
+      return fresh;
+    });
+    if (!made) return running;
+    const session = made;
     Store.cache.set(session.id, { id: session.id, events: [], encounters: [] });
-    ui.notifications.info(`Campaign Ledger: recording ${session.name}. Rename or end it from the ledger.`);
-    await startNotice(session, fresh);
+    ui.notifications.info(safe`Campaign Ledger: recording ${session.name}. Rename or end it from the ledger.`);
+    await startNotice(session, Store.index);
     return session;
   })();
   try {
@@ -275,6 +425,12 @@ async function activeSession({ create = true } = {}) {
   } finally {
     starting = null;
   }
+}
+
+/** "Session N", one past the highest N in use, so a deleted session's number isn't given out twice. */
+function nextSessionName(ix) {
+  const nums = ix.sessions.map((s) => /^Session (\d+)$/.exec(String(s.name ?? "").trim())?.[1]).filter(Boolean).map(Number);
+  return `Session ${nums.length ? Math.max(...nums) + 1 : ix.sessions.length + 1}`;
 }
 
 /**
@@ -289,7 +445,7 @@ async function expireStale(s) {
   const last = data.events.at(-1)?.t ?? s.start;
   if (now() - last < gap) return false;
   await endSession({ quiet: true, at: last });
-  ui.notifications.info(`Campaign Ledger: ${s.name} was still running from ${fmtDate(last)}; it has been ended and a new session starts now.`);
+  ui.notifications.info(safe`Campaign Ledger: ${s.name} was still running from ${fmtDate(last)}; it has been ended and a new session starts now.`);
   await whisperGM(`<h3><i class="fa-solid fa-circle-stop"></i> Ended ${esc(s.name)}</h3><p>It was still running from ${esc(fmtDate(last))}, so it has been ended as of its last event and a new session starts with this one. If that evening isn't over yet, use "Resume last session" in the ledger.</p>`, { notice: "expired", session: s.id });
   return true;
 }
@@ -321,21 +477,25 @@ async function startNotice(session, ix) {
 async function startSession() {
   await endSession({ quiet: true });
   starting = null;
-  const ix = Store.index;
-  ix.active = null;
-  await Store.setIndex(ix);
+  await Store.mutateIndex((ix) => {
+    ix.active = null;
+  });
   return activeSession();
 }
 
 async function endSession({ quiet = false, at = null, archive = false } = {}) {
   await Store.flushNow();
-  const ix = Store.index;
-  const s = ix.sessions.find((s) => s.id === ix.active);
+  const s = await Store.mutateIndex((ix) => {
+    const run = ix.sessions.find((x) => x.id === ix.active);
+    if (!run) return SKIP;
+    run.end = at ?? now();
+    ix.active = null;
+    return run;
+  });
   if (!s) return;
-  s.end = at ?? now();
-  ix.active = null;
-  await Store.setIndex(ix);
-  if (!quiet) ui.notifications.info(`Campaign Ledger: ended ${s.name}.`);
+  // What the recorder remembered from that session (who hit whom, cards seen) goes with it
+  Rec.forget(s.end);
+  if (!quiet) ui.notifications.info(safe`Campaign Ledger: ended ${s.name}.`);
   // Archived (and cleared) before the recap, so the recap is the first thing in the fresh chat
   if (archive) await archiveChat(s.id, { clear: true });
   if (game.settings.get(MOD, "recap") !== "off") await postRecap(s.id);
@@ -343,14 +503,16 @@ async function endSession({ quiet = false, at = null, archive = false } = {}) {
 
 /** Reopens the most recently ended session as the active one (for an evening that was ended too soon). */
 async function resumeSession() {
-  const ix = Store.index;
-  if (ix.active) return null;
-  const s = [...ix.sessions].filter((s) => s.end).sort((a, b) => b.end - a.end)[0];
+  const s = await Store.mutateIndex((ix) => {
+    if (ix.active) return SKIP;
+    const last = [...ix.sessions].filter((x) => x.end).sort((a, b) => b.end - a.end)[0];
+    if (!last) return SKIP;
+    last.end = null;
+    ix.active = last.id;
+    return last;
+  });
   if (!s) return null;
-  s.end = null;
-  ix.active = s.id;
-  await Store.setIndex(ix);
-  ui.notifications.info(`Campaign Ledger: resumed ${s.name}.`);
+  ui.notifications.info(safe`Campaign Ledger: resumed ${s.name}.`);
   return s;
 }
 
@@ -362,6 +524,7 @@ async function resumeSession() {
 // file by its URL but can't browse the folder) and are listed on a GM-only journal entry, not in the index setting
 // players read. That keeps them out of the players' view, not out of a determined player's console: Foundry sends
 // every journal entry, compendium and setting to every client (Foundry 14), the same protection GM journals have.
+// Whispered chat cards reach players' clients too, content included.
 
 /** The GM-only journal entry that records which archive files belong to which session. */
 function gmStore() {
@@ -420,7 +583,7 @@ async function archiveRow(m) {
       if (nameHidden(m)) {
         for (const x of pub.querySelectorAll(".message-header *")) {
           if (!x.children.length && x.textContent.trim() === m.alias) x.textContent = UNKNOWN_NAME;
-          for (const at of ["alt", "title", "aria-label", "data-tooltip"]) {
+          for (const at of ["alt", "title", "aria-label", "data-tooltip", "data-tooltip-text"]) {
             const v = x.getAttribute(at);
             if (m.alias && v?.includes(m.alias)) x.setAttribute(at, v.replaceAll(m.alias, UNKNOWN_NAME));
           }
@@ -477,8 +640,8 @@ let archiving = null;
  */
 async function archiveChat(sessionId, { clear = true } = {}) {
   if (!game.user.isGM) return null;
-  if (!isRecorder()) {
-    ui.notifications.warn(`Campaign Ledger: only the active GM (${game.users.activeGM?.name ?? "?"}) can archive the chat.`);
+  if (!game.users.activeGM?.isSelf) {
+    ui.notifications.warn(safe`Campaign Ledger: only the active GM (${game.users.activeGM?.name ?? "?"}) can archive the chat.`);
     return null;
   }
   if (archiving) {
@@ -487,15 +650,15 @@ async function archiveChat(sessionId, { clear = true } = {}) {
     return null;
   }
   let bar = null;
-  const done = () => { try { bar?.update?.({ pct: 1 }); } catch (e) { /* ignore */ } };
+  const done = () => bar?.update({ pct: 1 });
   const run = (async () => {
     const msgs = game.messages.contents.slice().sort((a, b) => a.timestamp - b.timestamp);
     if (!msgs.length) return null;
-    try { bar = ui.notifications.info(`Campaign Ledger: archiving ${msgs.length} chat message${msgs.length === 1 ? "" : "s"}`, { progress: true }); } catch (e) { /* older notification API */ }
+    bar = ui.notifications.info(safe`Campaign Ledger: archiving ${msgs.length} chat message${msgs.length === 1 ? "" : "s"}`, { progress: true });
     const rows = [];
     for (let i = 0; i < msgs.length; i++) {
       rows.push(await archiveRow(msgs[i]));
-      if (i % 25 === 0) try { bar?.update?.({ pct: (i / msgs.length) * 0.9 }); } catch (e) { /* ignore */ }
+      if (i % 25 === 0) bar.update({ pct: (i / msgs.length) * 0.9 });
     }
     // Messages from before any session go with the session being archived (see sessionAt).
     const groups = new Map();
@@ -554,8 +717,8 @@ async function archiveChat(sessionId, { clear = true } = {}) {
       }
     }
     done();
-    if (left) ui.notifications.warn(`Campaign Ledger: ${rows.length} chat messages archived (${where}), but ${left} couldn't be cleared from chat. They are in the archive; delete them by hand rather than archiving again.`, { permanent: true });
-    else ui.notifications.info(`Campaign Ledger: ${rows.length} chat message${rows.length === 1 ? "" : "s"} archived ${made.length > 1 ? `(${where})` : where}${clear ? " and cleared from chat" : ""}.`);
+    if (left) ui.notifications.warn(safe`Campaign Ledger: ${rows.length} chat messages archived (${where}), but ${left} couldn't be cleared from chat. They are in the archive; delete them by hand rather than archiving again.`, { permanent: true });
+    else ui.notifications.info(safe`Campaign Ledger: ${rows.length} chat message${rows.length === 1 ? "" : "s"} archived ${made.length > 1 ? `(${where})` : where}${clear ? " and cleared from chat" : ""}.`);
     refreshOpenApps();
     return made.map((m) => ({ session: m.sid, ...m.entry }));
   })();
@@ -565,7 +728,7 @@ async function archiveChat(sessionId, { clear = true } = {}) {
   } catch (e) {
     console.error(MOD, e);
     done();
-    ui.notifications.error(`Campaign Ledger: the chat wasn't archived (${e.message}). Nothing was deleted.`, { permanent: true });
+    ui.notifications.error(safe`Campaign Ledger: the chat wasn't archived (${e.message}). Nothing was deleted.`, { permanent: true });
     return null;
   } finally {
     archiving = null;
@@ -589,7 +752,7 @@ async function addPublicArchive(sessionId, a) {
 
 /** Puts back any players' copy the index lost (an import, a write that raced), from the GM store. Active GM only. */
 async function repairPublicArchives() {
-  if (!isRecorder()) return 0;
+  if (!(await isRecorder())) return 0;
   const chat = gmStore()?.flags?.[MOD]?.chat ?? {};
   let n = 0;
   for (const [sid, v] of Object.entries(chat)) {
@@ -651,150 +814,6 @@ function archiveTarget() {
 }
 
 const PAGE = 200;
-
-/* ------------------------------------------------------------------ */
-/* Window memory                                                      */
-/* ------------------------------------------------------------------ */
-
-/*
- * Window memory, shared verbatim with the author's other modules (keep the copies in sync). A window made with
- * rememberWindow keeps the size and place the user gives it, in this browser, and restores from minimized at full
- * size: Foundry's restore animation can stall at the title bar's height (seen on Foundry 14.370, core windows too)
- * and Foundry sets the size while it runs, which would leave the window a strip.
- */
-
-/** Wait for an element's own transitions to end; a hidden tab pauses them, so after a second they're finished by hand. */
-async function settleWindow(el) {
-  const anims = el?.getAnimations?.() ?? [];
-  if (!anims.length) return;
-  await Promise.race([Promise.all(anims.map((a) => a.finished.catch(() => null))), new Promise((r) => setTimeout(r, 1200))]);
-  for (const a of el.getAnimations?.() ?? []) {
-    try {
-      a.finish();
-    } catch {
-      /* an animation that can't finish (infinite) is left alone */
-    }
-  }
-}
-
-/**
- * Give an ApplicationV2 class window memory.
- * @param {typeof ApplicationV2} Base
- * @param {string} key          localStorage key for this window
- * @param {object} [opts]
- * @param {boolean|"width"} [opts.size] what to keep besides the place: true for width and height, "width" for a window
- *   whose height fits its content, false for a window sized wholly by its content
- */
-function rememberWindow(Base, key, { size = true } = {}) {
-  const MIN_W = 240, MIN_H = 120;
-  const load = () => {
-    let v;
-    try {
-      v = JSON.parse(globalThis.localStorage?.getItem(key) ?? "null");
-    } catch {
-      return {};
-    }
-    if (!v || typeof v !== "object") return {};
-    const W = globalThis.innerWidth ?? 1920, H = globalThis.innerHeight ?? 1080;
-    const out = {};
-    // A size saved while the window was collapsed is no size at all.
-    if (size === true && v.width >= MIN_W && v.height >= MIN_H) {
-      out.width = Math.min(v.width, W);
-      out.height = Math.min(v.height, H);
-    } else if (size === "width" && v.width >= MIN_W) out.width = Math.min(v.width, W);
-    const w = out.width ?? MIN_W, h = out.height ?? MIN_H;
-    if (Number.isFinite(v.left)) out.left = Math.max(0, Math.min(v.left, W - w));
-    if (Number.isFinite(v.top)) out.top = Math.max(0, Math.min(v.top, H - h));
-    return out;
-  };
-  let timer = null;
-  const save = (position) => {
-    // Copy now: Foundry hands over its own live position object, which may change before the save runs.
-    const pos = { left: position.left, top: position.top, width: position.width, height: position.height };
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      try {
-        const v = { left: pos.left, top: pos.top };
-        if (size) v.width = pos.width;
-        if (size === true) v.height = pos.height;
-        globalThis.localStorage?.setItem(key, JSON.stringify(v));
-      } catch {
-        /* no storage: the window opens where Foundry puts it */
-      }
-    }, 300);
-  };
-
-  return class extends Base {
-    #beforeMin = null;
-    #restoring = false;
-    #restore = null;
-
-    constructor(options = {}) {
-      super(foundry.utils.mergeObject({ position: load() }, options, { inplace: false }));
-    }
-
-    /** Restore a minimized window before drawing it: a draw that ends while it's collapsed takes the title bar's size. */
-    async render(options = {}, _options = {}) {
-      if ((this.minimized || this.#restore) && (options === true || options?.force)) {
-        const open = this.rendered;
-        await this.maximize();
-        // Closed while it was being restored: don't open it again.
-        if (open && !this.rendered) return this;
-      }
-      return super.render(options, _options);
-    }
-
-    async minimize() {
-      if (!this.minimized && this.rendered) {
-        const auto = this.options.position ?? {};
-        this.#beforeMin = {
-          width: auto.width === "auto" ? "auto" : this.position.width,
-          height: auto.height === "auto" ? "auto" : this.position.height,
-        };
-      }
-      return super.minimize();
-    }
-
-    maximize() {
-      // A restore already under way is the one to wait for.
-      if (this.#restore) return this.#restore;
-      if (!this.minimized) return super.maximize();
-      this.#restore = this.#restoreWhole().finally(() => (this.#restore = null));
-      return this.#restore;
-    }
-
-    async #restoreWhole() {
-      const was = this.#beforeMin;
-      this.#restoring = true;
-      try {
-        const pending = super.maximize();
-        for (const a of this.element?.getAnimations?.() ?? []) {
-          try {
-            a.finish();
-          } catch {
-            /* nothing to finish */
-          }
-        }
-        await pending;
-        await settleWindow(this.element);
-        // Not if it was closed or minimized again meanwhile.
-        if (was && this.rendered && !this.minimized) this.setPosition(was);
-      } finally {
-        this.#restoring = false;
-      }
-    }
-
-    /** Remember the size and place the user gives the window (not while it's minimized or being restored). */
-    _onPosition(position) {
-      super._onPosition?.(position);
-      if (!this.rendered || this.minimized || this.#restoring) return;
-      if (![position.left, position.top].every(Number.isFinite)) return;
-      if (size && !(position.width >= MIN_W)) return;
-      if (size === true && !(position.height >= MIN_H)) return;
-      save(position);
-    }
-  };
-}
 
 /** Text of an archived message's HTML, with block elements on their own lines. */
 function plainText(node) {
@@ -897,8 +916,8 @@ async function exportChat(sessionId) {
     gm = pick === "gm";
   }
   const out = await chatMarkdown(sessionId, { gm });
-  if (!out) return ui.notifications.warn(`Campaign Ledger: there's no ${gm ? "" : "players' "}archived chat for that session.`);
-  if (out.missing) ui.notifications.warn(`Campaign Ledger: ${out.missing} archive file${out.missing === 1 ? " is" : "s are"} missing, so the export is only part of the chat.`);
+  if (!out) return ui.notifications.warn(safe`Campaign Ledger: there's no ${gm ? "" : "players' "}archived chat for that session.`);
+  if (out.missing) ui.notifications.warn(safe`Campaign Ledger: ${out.missing} archive file${out.missing === 1 ? " is" : "s are"} missing, so the export is only part of the chat.`);
   const s = Store.index.sessions.find((x) => x.id === sessionId);
   const name = (s?.name ?? "session").replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "").toLowerCase() || "session";
   const date = s?.start ? `-${new Date(s.start).toISOString().slice(0, 10)}` : "";
@@ -909,7 +928,7 @@ async function exportChat(sessionId) {
  * A session's archived chat, oldest first, with search and filters. The GM reads the whole log; a player, the
  * players' copy.
  */
-class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size.archive`) {
+class ChatArchiveApp extends rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "archive", from: `${MOD}.size.archive` }) {
   static DEFAULT_OPTIONS = {
     id: "pcl-chat-archive",
     classes: ["pcl-app", "pcl-archive-app"],
@@ -972,7 +991,7 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
     const speakers = [...new Set(rows.map((m) => m.speaker).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     if (s.who && !speakers.includes(s.who)) s.who = "";
     const shown = rows.filter((m) => (!s.who || m.speaker === s.who) && (!s.rolls || m.roll) && (s.whispers || !m.whisper.length) && (!q || m.text.includes(q)));
-    const clean = (h) => (foundry.utils.cleanHTML ? foundry.utils.cleanHTML(h) : h);
+    const clean = (h) => foundry.utils.cleanHTML(h);
     const opt = (v, label, sel) => `<option value="${esc(v)}"${sel ? " selected" : ""}>${esc(label)}</option>`;
     el.innerHTML = `<header class="pcl-head pcl-archive-head">
         <select name="sid">${withChat.map((x) => opt(x.id, `${x.name} · ${fmtDate(x.start)}`, x.id === s.sid)).join("")}</select>
@@ -981,7 +1000,7 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
         <label><input type="checkbox" name="rolls"${s.rolls ? " checked" : ""}> Rolls only</label>
         ${gm ? `<label><input type="checkbox" name="whispers"${s.whispers ? " checked" : ""}> Whispers</label>` : ""}
         <span class="pcl-archive-count">${shown.length} of ${rows.length}${this.missing ? ` · ${this.missing} archive file${this.missing === 1 ? "" : "s"} missing` : ""}</span>
-        <button type="button" class="pcl-archive-export" data-action="pclExportChat" data-tooltip="Export this session's chat as Markdown"><i class="fa-solid fa-file-export"></i></button>
+        <button type="button" class="pcl-archive-export" data-action="pclExportChat" data-tooltip-text="Export this session's chat as Markdown"><i class="fa-solid fa-file-export"></i></button>
       </header>
       <section class="pcl-body"><ol class="chat-log pcl-archive-log">${shown.slice(0, s.shown).map((m) => clean(m.html)).join("")}</ol>
       ${shown.length > s.shown ? `<button type="button" class="pcl-more" data-action="pclMore">Show ${Math.min(PAGE, shown.length - s.shown)} more</button>` : ""}</section>`;
@@ -1048,41 +1067,62 @@ class ChatArchiveApp extends rememberWindow(foundry.applications.api.Application
  */
 async function importLedger(text) {
   let x;
-  try { x = JSON.parse(text); } catch (e) { throw new Error("that isn't a JSON file"); }
+  try {
+    x = JSON.parse(text);
+  } catch (e) {
+    throw new Error("that isn't a JSON file");
+  }
   if (x?.module !== MOD || !x.index?.sessions || !Array.isArray(x.sessions)) throw new Error("that isn't a Campaign Ledger export");
+  const why = Store.index.active ? await notRecording() : null;
+  if (why) throw new Error(`${why}; import from there`);
   await Store.flushNow();
-  const ix = Store.index;
-  for (const a of x.index.arcs ?? []) if (a?.id && !ix.arcs.some((b) => b.id === a.id)) ix.arcs.push({ id: a.id, name: String(a.name ?? "Arc") });
-  let added = 0, merged = 0;
-  const touched = [];
+  // A session's id becomes its file name, so an id from a hand-edited or foreign file must be a plain one
+  const ID = /^[A-Za-z0-9]{1,32}$/;
+  let added = 0, merged = 0, skipped = 0;
+  const incoming = [];
   for (const s of x.index.sessions) {
     if (!s?.id) continue;
-    const file = x.sessions.find((d) => d?.id === s.id) ?? {};
-    const events = Array.isArray(file.events) ? file.events : [];
-    const encounters = Array.isArray(file.encounters) ? file.encounters : [];
-    const mine = ix.sessions.find((m) => m.id === s.id);
-    if (!mine) {
-      ix.sessions.push({ id: s.id, name: String(s.name ?? "Session"), arc: s.arc ?? null, start: s.start ?? events[0]?.t ?? now(), end: s.end ?? events.at(-1)?.t ?? s.start ?? now() });
-      Store.cache.set(s.id, { id: s.id, events, encounters });
-      added++;
-    } else {
-      // Events have no id, so one is known by its whole content
-      const data = await Store.load(s.id);
-      const have = new Set(data.events.map((e) => JSON.stringify(e)));
-      const extra = events.filter((e) => !have.has(JSON.stringify(e)));
-      if (extra.length) {
-        data.events.push(...extra);
-        data.events.sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
-      }
-      for (const enc of encounters) if (enc?.id && !data.encounters.some((d) => d.id === enc.id)) data.encounters.push(enc);
-      merged++;
+    if (typeof s.id !== "string" || !ID.test(s.id)) {
+      skipped++;
+      continue;
     }
+    const file = x.sessions.find((d) => d?.id === s.id) ?? {};
+    const events = (Array.isArray(file.events) ? file.events : []).filter((e) => e && typeof e === "object");
+    // Events from before 1.1.1 get the id a read of their file would give them, so the two match
+    for (const e of events) e.id ??= contentId(e);
+    const encounters = (Array.isArray(file.encounters) ? file.encounters : []).filter((e) => typeof e?.id === "string" && ID.test(e.id));
+    incoming.push({ s, events, encounters });
+  }
+  const arcs = (x.index.arcs ?? []).filter((a) => typeof a?.id === "string" && ID.test(a.id));
+  const touched = [];
+  // Sessions already in the ledger get what they're missing; events have no id, so one is known by its whole content
+  const known = new Set(Store.index.sessions.map((m) => m.id));
+  for (const { s, events, encounters } of incoming) {
+    if (!known.has(s.id)) continue;
+    const data = await Store.load(s.id);
+    const have = new Set(data.events.map((e) => e.id));
+    const extra = events.filter((e) => !have.has(e.id));
+    if (extra.length) {
+      data.events.push(...extra);
+      data.events.sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+    }
+    for (const enc of encounters) if (enc?.id && !data.encounters.some((d) => d.id === enc.id)) data.encounters.push(enc);
+    merged++;
     touched.push(s.id);
   }
-  ix.sessions.sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
-  await Store.setIndex(ix);
+  await Store.mutateIndex((ix) => {
+    for (const a of arcs) if (!ix.arcs.some((b) => b.id === a.id)) ix.arcs.push({ id: a.id, name: String(a.name ?? "Arc") });
+    for (const { s, events, encounters } of incoming) {
+      if (known.has(s.id) || ix.sessions.some((m) => m.id === s.id)) continue;
+      ix.sessions.push({ id: s.id, name: String(s.name ?? "Session"), arc: ix.arcs.some((a) => a.id === s.arc) ? s.arc : null, start: s.start ?? events[0]?.t ?? now(), end: s.end ?? events.at(-1)?.t ?? s.start ?? now() });
+      Store.cache.set(s.id, { id: s.id, events, encounters });
+      added++;
+      touched.push(s.id);
+    }
+    ix.sessions.sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
+  });
   for (const id of touched) await Store.save(id);
-  return { added, merged };
+  return { added, merged, skipped };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1098,18 +1138,48 @@ const Rec = {
   lastCheck: new Map(),
   lastAbility: new Map(),
   recent: new Map(),
-  pdSource: new Map(), // "<target uuid>|<damage type>" -> who put that persistent damage on them
+  pdSource: new Map(), // "<target uuid>|<damage type>" -> { w, t }: who put that persistent damage on them
   pdTick: new Map(),   // target uuid -> { by, t } from the last persistent-damage roll
-  seen: new Set(),
-  thSlots: new Map(),
+  seen: new Map(),     // message keys already handled -> when
+  thSlots: new Map(),  // "<message>|<token>|<save>" -> { key, t }: the save last seen in that slot
   lastReroll: new Map(),  // who.k -> time of their last reroll message
   heroPending: new Map(), // who.k -> { ev, t }: a Hero Point that went down with no reroll yet
+  lastCard: new Map(),    // target uuid -> { m, t }: the last damage card on them
+  dying: new Map(),       // actor uuid -> their Dying value as last seen
+  undos: new Set(),       // a player's Revert waiting for its card to be marked (see watchUndo)
+  reverted: new Map(),    // "<actor uuid>|<amount>" -> when a card for that much on them was last marked reverted
+  revertAsks: new Map(),  // card id -> { user, t }: a player's client saying which card its Revert was for
+
+  /**
+   * Forget what was remembered up to `before` (a session's end), keeping anything newer. Cards already seen are kept
+   * one session longer: a Target Helper card from the session that just ended can still change, and its saves mustn't
+   * be counted again.
+   */
+  seenCut: -Infinity,
+  forget(before) {
+    const old = (t) => !(t > before);
+    for (const map of [this.lastHit, this.lastHeal, this.lastCheck, this.recent, this.pdSource, this.pdTick, this.thSlots, this.heroPending, this.lastCard, this.revertAsks]) {
+      for (const [k, v] of map) if (old(v?.t)) map.delete(k);
+    }
+    for (const map of [this.lastAbility, this.lastReroll, this.reverted]) for (const [k, t] of map) if (old(t)) map.delete(k);
+    // Forgetting the same session twice (the lead's own index write, then End session) moves the cut once
+    if (before > this.seenCut) {
+      for (const [k, t] of this.seen) if (!(t > this.seenCut)) this.seen.delete(k);
+      this.seenCut = before;
+    }
+  },
+
+  /** A target's persistent damage sources: one damage type, or all of them. */
+  dropPersistent(uuid, type = null) {
+    for (const k of this.pdSource.keys()) if (type ? k === `${uuid}|${type}` : k.startsWith(`${uuid}|`)) this.pdSource.delete(k);
+  },
 };
 
 async function record(evt) {
-  if (!isRecorder() || !recording()) return null;
+  if (!recording() || !(await isRecorder())) return null;
   const s = await activeSession();
   const data = await Store.load(s.id);
+  evt.id ??= foundry.utils.randomID(8);
   evt.t ??= now();
   const combat = Rec.encounter ? game.combats.get(Rec.encounter) : null;
   if (combat?.started) {
@@ -1196,6 +1266,8 @@ function primeCaches() {
   for (const a of actors) {
     Rec.hp.set(a.uuid, hpSnap(a));
     Rec.res.set(a.uuid, resSnap(a));
+    const dying = a.itemTypes?.condition?.find((c) => c.slug === "dying");
+    if (dying) Rec.dying.set(a.uuid, dying.value ?? dying.system?.value?.value ?? 1);
   }
 }
 
@@ -1216,10 +1288,10 @@ async function recordAbility(actor, tokenDoc, name) {
 }
 
 async function onChatMessage(msg) {
-  if (!isRecorder() || !recording()) return;
+  if (!recording() || !(await isRecorder())) return;
   const tagged = msg.flags?.[MOD]?.ability;
   if (tagged) {
-    Rec.seen.add(`ability|${msg.id}`);
+    Rec.seen.set(`ability|${msg.id}`, now());
     return recordAbility(msg.actor, msg.token, tagged);
   }
   const flags = msg.flags?.pf2e;
@@ -1238,6 +1310,12 @@ async function onChatMessage(msg) {
     const paid = heroReroll(w);
     const hero = paid || (ctx.options ?? []).includes("check:reroll:hero-points");
     await record({ k: "reroll", a: w, from: prev?.o ?? null, to, hero, nat: natD20(roll), fx: twice(roll) });
+    // A miss turned into a hit makes the attacker the last to hit the target; a hit turned into a miss undoes that
+    const tActor = type === "attack-roll" || type === "spell-attack-roll" ? actorFromUuid(ctx.target?.actor) : null;
+    if (tActor) {
+      if (to === null || to >= 2) Rec.lastHit.set(tActor.uuid, { w, t: now() });
+      else if (Rec.lastHit.get(tActor.uuid)?.w?.k === w.k) Rec.lastHit.delete(tActor.uuid);
+    }
     if (prev) {
       prev.nat0 ??= prev.nat;
       prev.o = to;
@@ -1294,17 +1372,18 @@ async function onChatMessage(msg) {
     const tTok = ctx?.target?.token ? fromUuidSync(ctx.target.token) : null;
     // Persistent damage is rolled by the creature taking it. It belongs to whoever put that damage type on
     // them (an acid flask's acid, a spell's fire): each persistent instance of a damage roll remembers its
-    // roller by target and type. Failing that, whoever last hit them.
+    // roller by target and type. Failing that, whoever last hit them within the attribution window.
     const persistent = isPersistent(msg, flags);
     const types = [...new Set((roll.instances ?? []).map((i) => i.type).filter(Boolean))];
     let by = w;
     if (persistent) {
-      const src = types.map((t) => Rec.pdSource.get(`${actor.uuid}|${t}`)).find((x) => x && x.k !== w.k) ?? Rec.lastHit.get(actor.uuid)?.w;
+      const last = Rec.lastHit.get(actor.uuid);
+      const src = types.map((t) => Rec.pdSource.get(`${actor.uuid}|${t}`)?.w).find((x) => x && x.k !== w.k) ?? (last && now() - last.t < ATTRIBUTION_WINDOW ? last.w : null);
       if (src && src.k !== w.k) by = src;
       Rec.pdTick.set(actor.uuid, { by, t: now() });
     } else if (tActor) {
       (heal ? Rec.lastHeal : Rec.lastHit).set(tActor.uuid, { w, t: now() });
-      for (const inst of roll.instances ?? []) if (inst.persistent && inst.type) Rec.pdSource.set(`${tActor.uuid}|${inst.type}`, w);
+      for (const inst of roll.instances ?? []) if (inst.persistent && inst.type) Rec.pdSource.set(`${tActor.uuid}|${inst.type}`, { w, t: now() });
     }
     await record({ k: heal ? "heal" : "dmg", a: by, amt: Number(roll.total) || 0, it: persistent ? `persistent ${types.join("/") || "damage"}` : (msg.item?.name ?? null), tg: persistent ? w : tActor ? who(tActor, tTok) : null, ...(persistent ? { pd: true } : {}) });
     return;
@@ -1336,9 +1415,12 @@ async function onDamageApplied(msg, flags) {
   // The HP change recorded a moment ago belongs to this card only if the card changed HP (a card can be all shield
   // or only persistent damage), and to one card only.
   const hpPath = (applied.updates ?? []).some((u) => u.path === "system.attributes.hp.value" || u.path === "system.attributes.hp.temp");
-  let recent = hpPath ? Rec.recent.get(target.uuid) : null;
-  if (recent && now() - recent.t > 5000) recent = null;
+  // Dying recorded just before a damage card (with no HP change of its own) is the card's too; a heal never claims it
+  let recent = Rec.recent.get(target.uuid) ?? null;
+  if (recent && (now() - recent.t > 5000 || !(hpPath || recent.dyingOnly) || (recent.dyingOnly && applied.isHealing))) recent = null;
   if (recent) Rec.recent.delete(target.uuid);
+  // Dying or dead that comes just after a card that hurt (or hit a creature already at 0 HP) is tagged with it (tagToCard)
+  if (!applied.isHealing && (hpPath || recent || (target.system?.attributes?.hp?.value ?? 1) <= 0)) Rec.lastCard.set(target.uuid, { m: msg.id, t: now() });
   if (!src) {
     // No source on the card: nothing to credit, but what it changed is still the card's, for its Revert button.
     if (!recent) return;
@@ -1355,12 +1437,12 @@ async function onDamageApplied(msg, flags) {
   const tg = who(target, msg.token);
   const item = flags.origin?.uuid ? fromUuidSync(flags.origin.uuid) : null;
   // Damage the creature did to itself (persistent damage, a backfiring ability) goes to the persistent tick it just
-  // rolled (within 15 seconds), else to whoever last hit it; otherwise it stays its own.
+  // rolled (within 15 seconds), else to whoever last hit it within the attribution window; otherwise it stays its own.
   let pd = false;
   if (!heal && a.k === tg.k) {
     const tick = Rec.pdTick.get(target.uuid);
     const last = Rec.lastHit.get(target.uuid);
-    const src = tick && now() - tick.t <= 15000 ? tick.by : last?.w;
+    const src = tick && now() - tick.t <= 15000 ? tick.by : last && now() - last.t < ATTRIBUTION_WINDOW ? last.w : null;
     if (src && src.k !== a.k) { a = src; pd = true; }
   }
   // Each event this card accounts for carries its message id (m), so the card's Revert button can take them back.
@@ -1383,14 +1465,70 @@ async function onDamageApplied(msg, flags) {
  * card goes: the damage or healing dealt, the damage or healing taken, and a kill, down or revive it caused.
  */
 async function onDamageReverted(msg) {
+  const applied = msg.flags?.pf2e?.appliedDamage;
+  const uuid = applied?.uuid ?? msg.actor?.uuid;
+  const amt = (applied?.updates ?? []).filter((u) => u.path === "system.attributes.hp.value" || u.path === "system.attributes.hp.temp").reduce((x, u) => x + Math.abs(Number(u.value) || 0), 0);
+  if (uuid) Rec.reverted.set(`${uuid}|${amt}`, now());
   const s = await activeSession({ create: false });
   if (!s) return;
   const data = await Store.load(s.id);
-  const before = data.events.length;
+  const gone = data.events.filter((e) => e.m === msg.id);
+  if (!gone.length) return;
   data.events = data.events.filter((e) => e.m !== msg.id);
-  if (data.events.length === before) return;
+  Store.drop(s.id, gone);
   Store.scheduleSave(s.id);
   refreshOpenApps();
+}
+
+/**
+ * PF2e's Revert puts HP back, then marks its card reverted, which takes back what the card recorded. A player can
+ * only mark a card they posted, so after a player's Revert of anyone else's card the mark never comes. The player's
+ * client says which card was clicked (see the Revert listener at ready); if no mark has come 3 seconds after the HP
+ * came back, that card is taken back. A client that didn't say (an older version) gets the newest card on this
+ * creature for the same amount. A GM's Revert always marks its card.
+ */
+function watchUndo(actor, w, prevHp, hp, userId) {
+  if (!w || game.users.get(userId)?.isGM) return;
+  const change = hp.v + hp.t - (prevHp.v + prevHp.t);
+  if (!change) return;
+  const max = actor.system?.attributes?.hp?.max;
+  const undo = { actor: actor.uuid, k: w.k, amt: Math.abs(change), heal: change < 0, atMax: change > 0 && hp.v >= max, user: userId, t: now() };
+  Rec.undos.add(undo);
+  setTimeout(() => {
+    Rec.undos.delete(undo);
+    takeBackCard(undo).catch((e) => console.error(MOD, e));
+  }, 3000);
+}
+
+async function takeBackCard(undo) {
+  const ix = Store.index;
+  const s = ix.sessions.find((x) => x.id === ix.active);
+  // A card from the session that just ended keeps its Revert button too
+  const prev = [...ix.sessions].filter((x) => x.end).sort((a, b) => b.end - a.end)[0];
+  const asked = [...Rec.revertAsks].filter(([, a]) => a.user === undo.user && Math.abs(a.t - undo.t) <= 5000).map(([m]) => m);
+  const about = (e) => e.a?.k === undo.k || e.tg?.k === undo.k;
+  for (const sess of [s, prev]) {
+    if (!sess) continue;
+    const data = await Store.load(sess.id);
+    let card = null;
+    if (asked.length) {
+      // The card the player clicked; gone already means it was marked (a player who posted it)
+      card = asked.find((m) => data.events.some((e) => e.m === m && about(e))) ?? null;
+    } else if (sess === s) {
+      // No word from the player's client: a mark for this amount just now means it was marked
+      if ((Rec.reverted.get(`${undo.actor}|${undo.amt}`) ?? -Infinity) >= undo.t - 3000) return;
+      const [dealt, took] = undo.heal ? ["healdone", "healed"] : ["dealt", "taken"];
+      const line = (e) => e.m && e.t > undo.t - 30 * 60000 && ((e.k === dealt && e.tg?.k === undo.k) || (e.k === took && e.a?.k === undo.k));
+      // HP clamped at its maximum came back short of the card's amount
+      card = data.events.findLast((e) => line(e) && e.amt === undo.amt)?.m ?? (undo.atMax ? data.events.findLast((e) => line(e) && e.amt > undo.amt)?.m : null) ?? null;
+    }
+    if (!card) continue;
+    Store.drop(sess.id, data.events.filter((e) => e.m === card));
+    data.events = data.events.filter((e) => e.m !== card);
+    Store.scheduleSave(sess.id);
+    refreshOpenApps();
+    return;
+  }
 }
 
 /**
@@ -1399,12 +1537,12 @@ async function onDamageReverted(msg) {
  * to its card and token, so a reroll updates the earlier result instead of counting twice.
  */
 async function onUpdateChatMessage(msg, changes) {
-  if (!isRecorder() || !recording()) return;
+  if (!recording() || !(await isRecorder())) return;
   if (changes.flags?.pf2e?.appliedDamage?.isReverted === true) return onDamageReverted(msg);
 
   const tagged = changes.flags?.[MOD]?.ability;
   if (tagged && !Rec.seen.has(`ability|${msg.id}`)) {
-    Rec.seen.add(`ability|${msg.id}`);
+    Rec.seen.set(`ability|${msg.id}`, now());
     await recordAbility(msg.actor, msg.token, tagged);
   }
 
@@ -1432,7 +1570,7 @@ async function onUpdateChatMessage(msg, changes) {
       const onCard = (e) => e.m === msg.id || e.ms?.includes(msg.id);
       const known = (e) => e.k === "save" && ((has(e, key) && (onCard(e) || now() - (e.t ?? 0) < COPY_WINDOW)) || (!e.m && recent(e) && has(e, oldKey)));
       if (Rec.seen.has(`${msg.id}|${key}`)) continue;
-      Rec.seen.add(`${msg.id}|${key}`);
+      Rec.seen.set(`${msg.id}|${key}`, now());
       const seenBefore = data.events.find(known);
       if (seenBefore) {
         // A copy on another card: that card is remembered too, so a later update of it matches at any age.
@@ -1445,8 +1583,8 @@ async function onUpdateChatMessage(msg, changes) {
       const o = degree(save.success);
       const nat = save.die ?? null;
       const slot = `${msg.id}|${tokenId}|${stat}`;
-      const earlier = Rec.thSlots.get(slot);
-      Rec.thSlots.set(slot, key);
+      const earlier = Rec.thSlots.get(slot)?.key;
+      Rec.thSlots.set(slot, { key, t: now() });
       // The slot remembers the exact earlier save; the prefix search is only for a reroll of a save seen before a reload
       const prev = (save.rerolled || earlier)
         ? data.events.findLast((e) => e.k === "save" && recent(e) && (earlier ? e.src === earlier || e.alt?.includes(earlier) : e.src?.startsWith(`${tokenId}|${stat}|`)))
@@ -1470,18 +1608,19 @@ async function onUpdateChatMessage(msg, changes) {
   }
 }
 
-async function onUpdateActor(actor, changes, options = {}) {
+async function onUpdateActor(actor, changes, options = {}, userId = null) {
   const prevHp = Rec.hp.get(actor.uuid);
   const prevRes = Rec.res.get(actor.uuid);
   const hp = hpSnap(actor);
   const res = resSnap(actor);
   Rec.hp.set(actor.uuid, hp);
   Rec.res.set(actor.uuid, res);
-  if (!isRecorder() || !recording()) return;
+  if (!recording() || !(await isRecorder())) return;
   const w = who(actor);
   if (!w) return;
 
   // An undo from a card's Revert button isn't healing or damage: the revert takes back what the card recorded.
+  if (prevHp && hp && changes.system?.attributes?.hp && options.damageUndo) watchUndo(actor, w, prevHp, hp, userId);
   if (prevHp && hp && changes.system?.attributes?.hp && !options.damageUndo) {
     // Only a change to HP itself counts. Temporary HP that went with it is part of the same hit (temp);
     // temporary HP cleared on its own (expired) isn't damage, and HP that rose with the maximum (a level,
@@ -1490,8 +1629,10 @@ async function onUpdateActor(actor, changes, options = {}) {
     const lostTemp = Math.max(0, prevHp.t - hp.t);
     const gained = hp.v - prevHp.v;
     const maxChanged = hp.m !== prevHp.m;
-    // Kept briefly so the "takes X damage" card that follows can name the real attacker or healer.
-    const recent = { t: now(), evs: [] };
+    // Kept briefly so the "takes X damage" card that follows can name the real attacker or healer. Dying recorded a
+    // moment before an HP loss comes along with it.
+    const before = Rec.recent.get(actor.uuid);
+    const recent = { t: now(), evs: before?.dyingOnly && lostHp > 0 && now() - before.t <= 5000 ? [...before.evs] : [] };
     Rec.recent.set(actor.uuid, recent);
     const keep = (ev) => ev && recent.evs.push(ev);
     if (lostHp > 0) keep(await record({ k: "taken", a: w, amt: lostHp + lostTemp, ...(lostTemp ? { temp: lostTemp } : {}), by: attribution(actor, Rec.lastHit) }));
@@ -1523,16 +1664,59 @@ async function onUpdateActor(actor, changes, options = {}) {
 }
 
 async function onDying(item, changes = null) {
-  if (!isRecorder() || !recording()) return;
   if (item.type !== "condition" || item.slug !== "dying") return;
   // An update that didn't change the value (a badge shown or hidden) isn't a new step toward dead
   if (changes && changes.system?.value?.value === undefined) return;
   const actor = item.actor;
   if (!actor?.hasPlayerOwner) return;
   const v = item.value ?? item.system?.value?.value ?? 1;
-  await record({ k: "dying", a: who(actor), v });
+  // A new condition starts from 0; a value never seen (a reload while dying) counts as a step up
+  const was = changes ? Rec.dying.get(actor.uuid) : 0;
+  Rec.dying.set(actor.uuid, v);
+  if (!recording() || !(await isRecorder())) return;
+  // Dying that went down (a successful recovery check) isn't a step toward dead
+  if (was !== undefined && v <= was) return;
+  const evs = [await record({ k: "dying", a: who(actor), v })];
   const max = actor.system?.attributes?.dying?.max ?? 4;
-  if (v >= max) await record({ k: "dead", a: who(actor) });
+  if (v >= max) evs.push(await record({ k: "dead", a: who(actor) }));
+  tagToCard(actor, evs.filter(Boolean));
+}
+
+/**
+ * Dying and dead that follow a damage card within a few seconds belong to that card, so its Revert takes them back
+ * too. Before the card has come, they wait with the HP change it will claim (or on their own, when HP didn't move).
+ */
+function tagToCard(actor, evs) {
+  if (!evs.length) return;
+  const recent = Rec.recent.get(actor.uuid);
+  if (recent && now() - recent.t <= 5000) {
+    recent.evs.push(...evs);
+    return;
+  }
+  const card = Rec.lastCard.get(actor.uuid);
+  if (card && now() - card.t <= 5000) {
+    for (const ev of evs) ev.m ??= card.m;
+    return;
+  }
+  Rec.recent.set(actor.uuid, { t: now(), evs, dyingOnly: true });
+}
+
+/** The condition went: the next Dying starts from 0, and the persistent damage it was no longer has a source. */
+function onDeleteItem(item) {
+  if (item.type !== "condition" || !item.actor) return;
+  if (item.slug === "dying") Rec.dying.delete(item.actor.uuid);
+  if (item.slug === "persistent-damage") {
+    const left = item.actor.itemTypes?.condition?.some((c) => c.slug === "persistent-damage" && c.id !== item.id);
+    Rec.dropPersistent(item.actor.uuid, left ? item.system?.persistent?.damageType ?? null : null);
+  }
+}
+
+/** A combatant's HP as it is now, so the first change to a creature on a scene the GM isn't viewing is seen. */
+function snapCombatant(c) {
+  const a = c?.actor;
+  if (!a || Rec.hp.has(a.uuid)) return;
+  Rec.hp.set(a.uuid, hpSnap(a));
+  Rec.res.set(a.uuid, resSnap(a));
 }
 
 async function findEncounter(id) {
@@ -1550,7 +1734,8 @@ function combatantRow(c) {
 }
 
 async function onCombatStart(combat) {
-  if (!isRecorder() || !recording()) return;
+  for (const c of combat.combatants) snapCombatant(c);
+  if (!recording() || !(await isRecorder())) return;
   const s = await activeSession();
   const data = await Store.load(s.id);
   Rec.encounter = combat.id;
@@ -1570,7 +1755,7 @@ async function onCombatStart(combat) {
 }
 
 async function onUpdateCombat(combat, changes) {
-  if (!isRecorder() || changes.round === undefined) return;
+  if (changes.round === undefined || !recording() || !(await isRecorder())) return;
   const f = await findEncounter(combat.id);
   if (!f?.enc) return;
   f.enc.rounds = Math.max(f.enc.rounds, combat.round);
@@ -1578,7 +1763,8 @@ async function onUpdateCombat(combat, changes) {
 }
 
 async function onCreateCombatant(combatant) {
-  if (!isRecorder()) return;
+  snapCombatant(combatant);
+  if (!recording() || !(await isRecorder())) return;
   const f = await findEncounter(combatant.combat?.id);
   if (!f?.enc) return;
   const row = combatantRow(combatant);
@@ -1587,7 +1773,10 @@ async function onCreateCombatant(combatant) {
 }
 
 async function onDeleteCombat(combat) {
-  if (!isRecorder()) return;
+  // Closes the encounter even with recording paused, so a pause mid-fight doesn't leave it open.
+  if (!(await isRecorder())) return;
+  // Persistent damage from this fight no longer has a source
+  for (const c of combat.combatants) if (c.actor) Rec.dropPersistent(c.actor.uuid);
   const f = await findEncounter(combat.id);
   if (Rec.encounter === combat.id) Rec.encounter = null;
   if (!f?.enc) return;
@@ -1628,12 +1817,22 @@ function weaponRow() {
 function aggregate(events) {
   const by = new Map();
   const get = (w) => {
-    if (!w?.k) return null;
+    if (typeof w?.k !== "string" || !w.k) return null;
     if (!by.has(w.k)) by.set(w.k, blank(w));
-    return by.get(w.k);
+    const row = by.get(w.k);
+    // Events come oldest first: a character renamed since shows under the newer name
+    if (w.n) row.n = w.n;
+    return row;
   };
+  let bad = 0;
   for (const e of events) {
     const a = get(e.a);
+    // Only dealt, healdone and kill can lack an actor; anything else without one (an import, a hand-edited file) is
+    // skipped rather than stopping every tab from drawing
+    if (!a && !["dealt", "healdone", "kill"].includes(e.k)) {
+      bad++;
+      continue;
+    }
     if (a && e.e) a.encounters.add(e.e);
     if (e.nat === 20 && a && e.k !== "reroll") a.nat20++;
     if (e.nat === 1 && a && e.k !== "reroll") a.nat1++;
@@ -1650,7 +1849,8 @@ function aggregate(events) {
         if (known) wpn.known++;
         if (e.o >= 2) wpn.hit++;
         if (e.o === 3) wpn.crit++;
-        if (e.o === 3 && e.tg) get(e.tg).critTaken++;
+        const tg = e.o === 3 ? get(e.tg) : null;
+        if (tg) tg.critTaken++;
         break;
       }
       case "dmg": {
@@ -1705,10 +1905,12 @@ function aggregate(events) {
       case "dead":
         a.dead++;
         break;
-      case "up":
+      case "up": {
         a.revived++;
-        if (e.by) get(e.by).revivedBy++;
+        const reviver = get(e.by);
+        if (reviver) reviver.revivedBy++;
         break;
+      }
       case "save": {
         // [rolls, passed, critical failures, rolls with a known DC]
         const s = a.saves[e.s] ?? (a.saves[e.s] = [0, 0, 0, 0]);
@@ -1717,8 +1919,8 @@ function aggregate(events) {
         if (e.o >= 2) s[1]++;
         if (e.o === 0) s[2]++;
         // Credit the caster with saves forced on the other side (not on their own allies).
-        if (e.by && e.a && e.by.p !== e.a.p) {
-          const c = get(e.by);
+        const c = e.by && e.a && e.by.p !== e.a.p ? get(e.by) : null;
+        if (c) {
           c.forced++;
           if (e.o === 0 || e.o === 1) c.forcedFail++;
         }
@@ -1768,7 +1970,10 @@ function aggregate(events) {
         break;
     }
   }
+  if (bad) console.warn(`${MOD} | ${bad === 1 ? "1 event without the character it needs was" : `${bad} events without the character they need were`} left out of the totals`);
   for (const a of by.values()) {
+    // A party character is shown under its name today
+    if (a.k.startsWith("a:")) a.n = game.actors.get(a.k.slice(2))?.name ?? a.n;
     const sv = Object.values(a.saves);
     a.saveN = sv.reduce((x, s) => x + s[3], 0);
     a.savePass = sv.reduce((x, s) => x + s[1], 0);
@@ -1875,7 +2080,7 @@ function histogram(st) {
       bars.push(`<path class="pcl-bar" d="M${x},${y1} V${y0 + r} Q${x},${y0} ${x + r},${y0} H${x + w - r} Q${x + w},${y0} ${x + w},${y0 + r} V${y1} Z"/>`);
     }
     const share = Math.round((c / st.n) * 100);
-    bars.push(`<rect class="pcl-hit" x="${x - 1}" y="${T}" width="${bw}" height="${ph}" data-tooltip="Rolled a ${f}: ${c} time${c === 1 ? "" : "s"} (${share}%)"/>`);
+    bars.push(`<rect class="pcl-hit" x="${x - 1}" y="${T}" width="${bw}" height="${ph}" data-tooltip-text="Rolled a ${f}: ${c} time${c === 1 ? "" : "s"} (${share}%)"/>`);
     bars.push(`<text class="pcl-axis" x="${x + w / 2}" y="${H - 8}" text-anchor="middle">${f}</text>`);
   }
   const ey = y(expected);
@@ -1977,7 +2182,7 @@ const PARTY_COLUMNS = [
   { key: "rerolls", label: "Rerolls", group: "Dice", fmt: (a) => (a.rerolls ? `${a.rerollsBetter}/${a.rerolls}` : "–"), tip: "Rerolls that improved the result / all rerolls" },
 ];
 
-class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `${MOD}.size`) {
+class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, { module: MOD, name: "main", from: `${MOD}.size` }) {
   static DEFAULT_OPTIONS = {
     id: "pf2e-campaign-ledger",
     classes: ["pcl-app"],
@@ -2107,9 +2312,10 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
       this.render();
     });
     q("select[name=currentArc]")?.addEventListener("change", async (e) => {
-      const ix = Store.index;
-      ix.currentArc = e.target.value || null;
-      await Store.setIndex(ix);
+      const arc = e.target.value || null;
+      await Store.mutateIndex((ix) => {
+        ix.currentArc = arc;
+      });
     });
     for (const input of this.element.querySelectorAll("[data-edit]")) {
       input.addEventListener("change", (e) => this.#onEdit(e.target));
@@ -2121,7 +2327,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
   #header({ ix }) {
     const arcName = (id) => ix.arcs.find((a) => a.id === id)?.name ?? "No arc";
     const opts = [`<option value="all">Whole campaign</option>`];
-    for (const a of ix.arcs) opts.push(`<option value="arc:${a.id}">Arc: ${esc(a.name)}</option>`);
+    for (const a of ix.arcs) opts.push(`<option value="arc:${esc(a.id)}">Arc: ${esc(a.name)}</option>`);
     for (const s of [...ix.sessions].reverse()) opts.push(`<option value="session:${s.id}">${esc(s.name)} · ${fmtDate(s.start)}</option>`);
     const scope = opts.join("").replace(`value="${this.state.scope}"`, `value="${this.state.scope}" selected`);
     const active = ix.sessions.find((s) => s.id === ix.active);
@@ -2130,19 +2336,19 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
       : `<span class="pcl-idle">No session running. One starts by itself on the first roll.</span>`;
     let gm = "";
     if (this.isGM) {
-      const arcOpts = [`<option value="">No arc</option>`, ...ix.arcs.map((a) => `<option value="${a.id}" ${a.id === ix.currentArc ? "selected" : ""}>${esc(a.name)}</option>`)].join("");
+      const arcOpts = [`<option value="">No arc</option>`, ...ix.arcs.map((a) => `<option value="${esc(a.id)}" ${a.id === ix.currentArc ? "selected" : ""}>${esc(a.name)}</option>`)].join("");
       gm = `<div class="pcl-gm">
         <label>Current arc <select name="currentArc">${arcOpts}</select></label>
         <button type="button" data-action="addArc"><i class="fa-solid fa-plus"></i> Arc</button>
         ${active ? `<button type="button" data-action="endSession"><i class="fa-solid fa-stop"></i> End session</button>` : ""}
         <button type="button" data-action="startSession"><i class="fa-solid fa-play"></i> New session</button>
-        ${game.messages.size && ix.sessions.length ? `<button type="button" data-action="archiveChat" data-tooltip="Copy the chat log into the ledger with ${esc((active ?? archiveTarget())?.name ?? "the session")}, and clear it"><i class="fa-solid fa-box-archive"></i> Archive chat</button>` : ""}
-        ${!active && ix.sessions.some((s) => s.end) ? `<button type="button" data-action="resumeSession" data-tooltip="Reopen the last ended session and keep recording into it"><i class="fa-solid fa-rotate-left"></i> Resume last session</button>` : ""}
+        ${game.messages.size && ix.sessions.length ? `<button type="button" data-action="archiveChat" data-tooltip-text="Copy the chat log into the ledger with ${esc((active ?? archiveTarget())?.name ?? "the session")}, and clear it"><i class="fa-solid fa-box-archive"></i> Archive chat</button>` : ""}
+        ${!active && ix.sessions.some((s) => s.end) ? `<button type="button" data-action="resumeSession" data-tooltip-text="Reopen the last ended session and keep recording into it"><i class="fa-solid fa-rotate-left"></i> Resume last session</button>` : ""}
       </div>`;
     }
     return `<header class="pcl-head">
       <div class="pcl-scope"><label>Showing <select name="scope">${scope}</select></label>
-      <button type="button" data-action="refresh" data-tooltip="Reload"><i class="fa-solid fa-rotate"></i></button></div>
+      <button type="button" data-action="refresh" data-tooltip-text="Reload"><i class="fa-solid fa-rotate"></i></button></div>
       ${live}${gm}</header>`;
   }
 
@@ -2181,13 +2387,13 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     const head1 = groups.map((g) => `<th colspan="${g.span}" class="pcl-group">${g.name}</th>`).join("");
     const head2 = PARTY_COLUMNS.map((c) => {
       const arrow = c.key === key ? (dir < 0 ? " ▾" : " ▴") : "";
-      return `<th data-action="sort" data-key="${c.key}" ${c.tip ? `data-tooltip="${esc(c.tip)}"` : ""}>${c.label}${arrow}</th>`;
+      return `<th data-action="sort" data-key="${c.key}" ${c.tip ? `data-tooltip-text="${esc(c.tip)}"` : ""}>${c.label}${arrow}</th>`;
     }).join("");
     const rows = party.map((a) => `<tr>${PARTY_COLUMNS.map((c) => {
       const v = c.fmt ? c.fmt(a) : (a[c.key] ?? 0) || "–";
       const lead = !c.text && party.length > 1 && best[c.key] > 0 && a[c.key] === best[c.key] && !["nat1", "taken", "critTaken", "down", "dead"].includes(c.key);
       const tip = c.tipf ? c.tipf(a) : "";
-      return `<td class="${c.text ? "pcl-name" : ""} ${lead ? "pcl-lead" : ""}" ${tip ? `data-tooltip="${esc(tip)}"` : ""}>${v}</td>`;
+      return `<td class="${c.text ? "pcl-name" : ""} ${lead ? "pcl-lead" : ""}" ${tip ? `data-tooltip-text="${esc(tip)}"` : ""}>${v}</td>`;
     }).join("")}</tr>`).join("");
     return this.#highlights(party, data) + `<table class="pcl-table pcl-party"><thead><tr>${head1}</tr><tr>${head2}</tr></thead><tbody>${rows}</tbody></table>
       <p class="pcl-note">Damage and healing are what was applied from a chat card, after resistances; hover for the amount rolled. Damage taken is what came off HP, with any temporary HP that went with it. Click a column to sort.</p>`;
@@ -2274,12 +2480,12 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
       let detail = "";
       if (open) {
         const list = this.isGM ? [...party, ...foes] : party;
-        detail = `<tr class="pcl-detail"><td colspan="10"><table class="pcl-table"><thead><tr><th>Combatant</th><th>Attacks</th><th>Hit %</th><th>Crits</th><th>Damage</th><th data-tooltip="Spells cast">Spells</th><th data-tooltip="Saves forced on the other side: failed / rolled">Saves forced</th><th data-tooltip="Skill checks that succeeded / against a DC">Skills</th><th data-tooltip="Actions and feats used">Abilities</th><th>Healing</th><th>Taken</th><th>Kills</th><th>Downed</th></tr></thead><tbody>
+        detail = `<tr class="pcl-detail"><td colspan="10"><table class="pcl-table"><thead><tr><th>Combatant</th><th>Attacks</th><th>Hit %</th><th>Crits</th><th>Damage</th><th data-tooltip-text="Spells cast">Spells</th><th data-tooltip-text="Saves forced on the other side: failed / rolled">Saves forced</th><th data-tooltip-text="Skill checks that succeeded / against a DC">Skills</th><th data-tooltip-text="Actions and feats used">Abilities</th><th>Healing</th><th>Taken</th><th>Kills</th><th>Downed</th></tr></thead><tbody>
           ${list.map((a) => `<tr class="${a.p ? "" : "pcl-foe"}"><td class="pcl-name">${esc(a.n)}</td><td>${a.atk || "–"}</td><td>${pct(a.hit, a.atkKnown)}</td><td>${a.crit || "–"}</td><td>${a.dealt || "–"}</td><td>${a.spellN || "–"}</td><td>${a.forced ? `${a.forcedFail}/${a.forced}` : "–"}</td><td>${a.skillN ? `${a.skillPass}/${a.skillKnown}` : "–"}</td><td>${a.abilityN || "–"}</td><td>${a.healDone || "–"}</td><td>${a.taken || "–"}</td><td>${a.kills || "–"}</td><td>${a.down || "–"}</td></tr>`).join("")}
           </tbody></table>${this.#roundLog(evs)}</td></tr>`;
       }
-      return `<tr class="pcl-click" data-action="encounter" data-id="${enc.id}">
-        <td>${fmtDate(enc.start)}</td><td>${esc(sessName(enc.sid))}</td><td class="pcl-name">${esc(enc.name || enc.scene)}${this.isGM ? ` <a data-action="renameEncounter" data-id="${enc.id}" data-sid="${enc.sid}" data-tooltip="Rename this encounter"><i class="fa-solid fa-pencil"></i></a>` : ""}</td>
+      return `<tr class="pcl-click" data-action="encounter" data-id="${esc(enc.id)}">
+        <td>${fmtDate(enc.start)}</td><td>${esc(sessName(enc.sid))}</td><td class="pcl-name">${esc(enc.name || enc.scene)}${this.isGM ? ` <a data-action="renameEncounter" data-id="${esc(enc.id)}" data-sid="${esc(enc.sid)}" data-tooltip-text="Rename this encounter"><i class="fa-solid fa-pencil"></i></a>` : ""}</td>
         <td>${enc.rounds}</td><td>${fmtDuration((enc.end ?? now()) - enc.start)}${enc.end ? "" : " (running)"}</td>
         <td>${sum(party, "dealt") || "–"}</td><td>${sum(foes, "dealt") || "–"}</td><td>${sum(party, "kills") || "–"}</td>
         <td>${sum(party, "down") || "–"}</td><td>${sum(party, "crit")} / ${sum(foes, "crit")}</td></tr>${detail}`;
@@ -2339,25 +2545,25 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
   #sessions({ ix }) {
     const chatIcon = (s) => {
       const n = this.isGM ? archivesOf(s.id).reduce((t, a) => t + a.n, 0) : playersReadChat() ? (s.chat ?? []).reduce((t, a) => t + a.n, 0) : 0;
-      return n ? `<a data-action="viewChat" data-id="${s.id}" data-tooltip="Archived chat (${n} message${n === 1 ? "" : "s"})"><i class="fa-solid fa-comments"></i></a> ` : "";
+      return n ? `<a data-action="viewChat" data-id="${s.id}" data-tooltip-text="Archived chat (${n} message${n === 1 ? "" : "s"})"><i class="fa-solid fa-comments"></i></a> ` : "";
     };
-    const arcOpts = (sel) => [`<option value="">No arc</option>`, ...ix.arcs.map((a) => `<option value="${a.id}" ${a.id === sel ? "selected" : ""}>${esc(a.name)}</option>`)].join("");
+    const arcOpts = (sel) => [`<option value="">No arc</option>`, ...ix.arcs.map((a) => `<option value="${esc(a.id)}" ${a.id === sel ? "selected" : ""}>${esc(a.name)}</option>`)].join("");
     const rows = [...ix.sessions].reverse().map((s) => {
       const name = this.isGM ? `<input type="text" data-edit="sessionName" data-id="${s.id}" value="${esc(s.name)}">` : esc(s.name);
       const arc = this.isGM ? `<select data-edit="sessionArc" data-id="${s.id}">${arcOpts(s.arc)}</select>` : esc(ix.arcs.find((a) => a.id === s.arc)?.name ?? "–");
       const state = s.id === ix.active ? `<span class="pcl-live"><i class="fa-solid fa-circle"></i> Recording</span>` : fmtDuration((s.end ?? s.start) - s.start);
       const gm = this.isGM
-        ? `<a data-action="recap" data-id="${s.id}" data-tooltip="Post a recap to chat"><i class="fa-solid fa-scroll"></i></a> <a data-action="deleteSession" data-id="${s.id}" data-tooltip="Delete session"><i class="fa-solid fa-trash"></i></a>`
+        ? `<a data-action="recap" data-id="${s.id}" data-tooltip-text="Post a recap to chat"><i class="fa-solid fa-scroll"></i></a> <a data-action="deleteSession" data-id="${s.id}" data-tooltip-text="Delete session"><i class="fa-solid fa-trash"></i></a>`
         : "";
       return `<tr><td class="pcl-name">${name}</td><td>${arc}</td><td>${fmtDate(s.start)}</td><td>${state}</td>
-        <td><a data-action="viewSession" data-id="${s.id}" data-tooltip="Show this session"><i class="fa-solid fa-eye"></i></a> ${chatIcon(s)}${gm}</td></tr>`;
+        <td><a data-action="viewSession" data-id="${s.id}" data-tooltip-text="Show this session"><i class="fa-solid fa-eye"></i></a> ${chatIcon(s)}${gm}</td></tr>`;
     }).join("");
     const arcs = this.isGM
-      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${a.id}" value="${esc(a.name)}"></td><td>${((n) => `${n} session${n === 1 ? "" : "s"}`)(ix.sessions.filter((s) => s.arc === a.id).length)}</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
+      ? `<h3>Arcs</h3><table class="pcl-table pcl-arcs"><tbody>${ix.arcs.map((a) => `<tr><td><input type="text" data-edit="arcName" data-id="${esc(a.id)}" value="${esc(a.name)}"></td><td>${((n) => `${n} session${n === 1 ? "" : "s"}`)(ix.sessions.filter((s) => s.arc === a.id).length)}</td></tr>`).join("") || `<tr><td>No arcs yet. Add one with the Arc button above.</td></tr>`}</tbody></table>`
       : "";
     const tools = this.isGM
       ? `<div class="pcl-tools"><button type="button" data-action="exportData"><i class="fa-solid fa-file-export"></i> Export everything</button>
-         <button type="button" data-action="importData" data-tooltip="Restore sessions and arcs from an export. Nothing already here is removed."><i class="fa-solid fa-file-import"></i> Import</button>
+         <button type="button" data-action="importData" data-tooltip-text="Restore sessions and arcs from an export. Nothing already here is removed."><i class="fa-solid fa-file-import"></i> Import</button>
          <button type="button" data-action="reset" class="pcl-danger"><i class="fa-solid fa-trash-can"></i> Reset ledger</button></div>`
       : "";
     return `${ix.sessions.length ? `<table class="pcl-table pcl-sessions"><thead><tr><th>Session</th><th>Arc</th><th>Date</th><th>Length</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="pcl-empty">No sessions yet.</p>`}${arcs}${tools}`;
@@ -2367,19 +2573,20 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
 
   async #onEdit(target) {
     if (!game.user.isGM) return;
-    const ix = Store.index;
     const { edit, id } = target.dataset;
-    if (edit === "sessionName") {
-      const s = ix.sessions.find((s) => s.id === id);
-      if (s) s.name = target.value.trim() || s.name;
-    } else if (edit === "sessionArc") {
-      const s = ix.sessions.find((s) => s.id === id);
-      if (s) s.arc = target.value || null;
-    } else if (edit === "arcName") {
-      const a = ix.arcs.find((a) => a.id === id);
-      if (a) a.name = target.value.trim() || a.name;
-    }
-    await Store.setIndex(ix);
+    const value = target.value;
+    await Store.mutateIndex((ix) => {
+      if (edit === "sessionName") {
+        const s = ix.sessions.find((s) => s.id === id);
+        if (s) s.name = value.trim() || s.name;
+      } else if (edit === "sessionArc") {
+        const s = ix.sessions.find((s) => s.id === id);
+        if (s) s.arc = value || null;
+      } else if (edit === "arcName") {
+        const a = ix.arcs.find((a) => a.id === id);
+        if (a) a.name = value.trim() || a.name;
+      }
+    });
     this.render();
   }
 
@@ -2404,6 +2611,8 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
   static async #onRenameEncounter(event, target) {
     if (!game.user.isGM) return;
     const { id, sid } = target.dataset;
+    const why = sid === Store.index.active ? await notRecording() : null;
+    if (why) return ui.notifications.warn(safe`Campaign Ledger: ${why}. Rename the encounter there.`);
     const data = await Store.load(sid);
     const enc = data.encounters.find((e) => e.id === id);
     if (!enc) return;
@@ -2416,7 +2625,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     if (name) enc.name = name;
     else delete enc.name;
     await Store.save(sid);
-    await Store.setIndex(Store.index);
+    await Store.mutateIndex(() => null);
     this.render();
   }
 
@@ -2445,7 +2654,7 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     });
     if (!choice || choice === "cancel") return;
     if (Store.index.active !== s.id) {
-      ui.notifications.warn(`Campaign Ledger: ${s.name} had already ended.`);
+      ui.notifications.warn(safe`Campaign Ledger: ${s.name} had already ended.`);
       return this.render();
     }
     await endSession({ archive: choice.archive });
@@ -2462,12 +2671,13 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
 
   static async #onAddArc() {
     if (!game.user.isGM) return;
-    const ix = Store.index;
-    const arc = { id: uid(), name: `Arc ${ix.arcs.length + 1}` };
-    ix.arcs.push(arc);
-    ix.currentArc = arc.id;
-    await Store.setIndex(ix);
-    ui.notifications.info(`Campaign Ledger: added ${arc.name} and made it the current arc. Rename it on the Sessions tab.`);
+    const arc = await Store.mutateIndex((ix) => {
+      const made = { id: uid(), name: `Arc ${ix.arcs.length + 1}` };
+      ix.arcs.push(made);
+      ix.currentArc = made.id;
+      return made;
+    });
+    ui.notifications.info(safe`Campaign Ledger: added ${arc.name} and made it the current arc. Rename it on the Sessions tab.`);
     this.render();
   }
 
@@ -2485,18 +2695,18 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
 
   static async #onDeleteSession(event, target) {
     if (!game.user.isGM) return;
-    const ix = Store.index;
-    const s = ix.sessions.find((s) => s.id === target.dataset.id);
+    const s = Store.index.sessions.find((s) => s.id === target.dataset.id);
     if (!s) return;
-    const ok = await foundry.applications.api.DialogV2.confirm({ window: { title: "Delete session" }, content: `<p>Delete <strong>${esc(s.name)}</strong> and everything recorded in it? This can't be undone from the ledger (its file stays on disk, and an export can bring it back with Import).</p>` });
+    const ok = await foundry.applications.api.DialogV2.confirm({ window: { title: "Delete session" }, content: `<p>Delete <strong>${esc(s.name)}</strong> and everything recorded in it? This can't be undone from the ledger (its file stays on disk, and an export can bring it back with Import).</p><p>Its archived chat stays on the server, but the ledger can't open it any more.</p>` });
     if (!ok) return;
-    ix.sessions = ix.sessions.filter((x) => x.id !== s.id);
-    if (ix.active === s.id) {
-      ix.active = null;
-      Rec.encounter = null;
-    }
+    await Store.mutateIndex((ix) => {
+      ix.sessions = ix.sessions.filter((x) => x.id !== s.id);
+      if (ix.active === s.id) {
+        ix.active = null;
+        Rec.encounter = null;
+      }
+    });
     Store.forget(s.id);
-    await Store.setIndex(ix);
     this.state.scope = "all";
     this.render();
   }
@@ -2519,11 +2729,11 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     });
     if (!file) return;
     try {
-      const { added, merged } = await importLedger(await file.text());
-      ui.notifications.info(`Campaign Ledger: imported ${added} new session${added === 1 ? "" : "s"}, merged ${merged}.`);
+      const { added, merged, skipped } = await importLedger(await file.text());
+      ui.notifications.info(safe`Campaign Ledger: imported ${added} new session${added === 1 ? "" : "s"}, merged ${merged}${skipped ? `, skipped ${skipped} with an id that can't be a file name` : ""}.`);
     } catch (e) {
       console.error(MOD, e);
-      ui.notifications.error(`Campaign Ledger: couldn't import (${e.message}).`);
+      ui.notifications.error(safe`Campaign Ledger: couldn't import (${e.message}).`);
     }
     this.render();
   }
@@ -2532,13 +2742,16 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
     if (!game.user.isGM) return;
     const ok = await foundry.applications.api.DialogV2.confirm({
       window: { title: "Reset Campaign Ledger" },
-      content: "<p>This clears every session, arc and encounter from the ledger. A full export downloads first so nothing is lost for good; Import brings it back.</p><p>Reset the ledger?</p>",
+      content: "<p>This clears every session, arc and encounter from the ledger. A full export downloads first; Import brings it back.</p><p>Archived chat isn't in the export: it stays on the server, but the ledger can't open it any more.</p><p>Reset the ledger?</p>",
     });
     if (!ok) return;
     await LedgerApp.#onExport.call(this);
     Store.cache.clear();
     Rec.encounter = null;
-    await Store.setIndex(foundry.utils.deepClone(DEFAULT_INDEX));
+    await Store.mutateIndex((ix) => {
+      for (const k of Object.keys(ix)) delete ix[k];
+      Object.assign(ix, foundry.utils.deepClone(DEFAULT_INDEX));
+    });
     this.state.scope = "all";
     ui.notifications.info("Campaign Ledger: reset. The export is in your downloads.");
     this.render();
@@ -2576,11 +2789,11 @@ class LedgerApp extends rememberWindow(foundry.applications.api.ApplicationV2, `
 
   static open() {
     if (!game.user.isGM && !game.settings.get(MOD, "playerView")) return ui.notifications.warn("The GM hasn't opened the Campaign Ledger to players.");
-    const existing = [...openApps][0];
-    if (existing) return existing.render({ force: true });
-    return new LedgerApp().render({ force: true });
+    return ledgerWindow.open();
   }
 }
+
+const ledgerWindow = singleWindow(() => new LedgerApp());
 
 /** The settings menu makes its own window of whatever type it's given; this one just opens the ledger the normal way. */
 class LedgerMenu extends foundry.applications.api.ApplicationV2 {
@@ -2593,6 +2806,25 @@ class LedgerMenu extends foundry.applications.api.ApplicationV2 {
 /* ------------------------------------------------------------------ */
 /* Registration                                                       */
 /* ------------------------------------------------------------------ */
+
+let leadCheck = null;
+function onSocket(msg, senderId) {
+  if (tabs.handle(msg, senderId)) {
+    // Another tab of this GM spoke: once a new tab has settled in, this one may no longer lead
+    if (leading) {
+      clearTimeout(leadCheck);
+      leadCheck = setTimeout(() => {
+        if (leading && !tabs.isLead()) loseLead().catch((e) => console.error(MOD, e));
+      }, 2500);
+    }
+    return;
+  }
+  if (msg?.type === "revert" && typeof msg.m === "string" && msg.m.length <= 32 && leading) {
+    Rec.revertAsks.set(msg.m, { user: senderId, t: now() });
+    // Only the last few count
+    if (Rec.revertAsks.size > 50) Rec.revertAsks.delete(Rec.revertAsks.keys().next().value);
+  }
+}
 
 Hooks.once("init", () => {
   game.settings.register(MOD, "index", { scope: "world", config: false, type: Object, default: foundry.utils.deepClone(DEFAULT_INDEX) });
@@ -2643,14 +2875,19 @@ Hooks.once("ready", () => {
   game.modules.get(MOD).api = { open: () => LedgerApp.open(), startSession, endSession, resumeSession, importLedger, Store, aggregate, archiveChat, archivesOf, publicArchivesOf, rebuildChatIndex, viewChat: (id) => ChatArchiveApp.open(id) };
   lastActive = Store.index.active;
   primeCaches();
+  // The socket handler before start(), so no answer from another tab is missed.
+  game.socket.on(`module.${MOD}`, onSocket);
+  tabs.start();
+  // A page being frozen (a background tab) hands its last events over and stops recording
+  document.addEventListener("freeze", () => loseLead().catch((e) => console.error(MOD, e)));
+  // A player's Revert on a card they can't mark: tell the recording GM which card it was
+  document.addEventListener("click", (event) => {
+    const button = event.target?.closest?.('button[data-action="revertDamage"]');
+    const m = button?.closest("[data-message-id]")?.dataset.messageId;
+    if (m && !game.user.isGM) game.socket.emit(`module.${MOD}`, { type: "revert", m });
+  }, true);
   repairPublicArchives().catch((e) => console.error(MOD, e));
-  if (isRecorder() && game.combat?.started) {
-    activeSession({ create: false }).then(async (s) => {
-      if (!s) return;
-      const data = await Store.load(s.id);
-      if (data.encounters.some((e) => e.id === game.combat.id && !e.end)) Rec.encounter = game.combat.id;
-    });
-  }
+  isRecorder().catch((e) => console.error(MOD, e));
 });
 
 Hooks.on("canvasReady", () => primeCaches());
@@ -2660,9 +2897,10 @@ Hooks.on("createChatMessage", (msg) => {
   onChatMessage(msg).catch((e) => console.error(MOD, e));
 });
 Hooks.on("updateChatMessage", (msg, changes) => onUpdateChatMessage(msg, changes).catch((e) => console.error(MOD, e)));
-Hooks.on("updateActor", (a, c, o) => onUpdateActor(a, c, o).catch((e) => console.error(MOD, e)));
+Hooks.on("updateActor", (a, c, o, userId) => onUpdateActor(a, c, o, userId).catch((e) => console.error(MOD, e)));
 Hooks.on("createItem", (i) => onDying(i).catch((e) => console.error(MOD, e)));
 Hooks.on("updateItem", (i, c) => onDying(i, c ?? {}).catch((e) => console.error(MOD, e)));
+Hooks.on("deleteItem", (i) => onDeleteItem(i));
 Hooks.on("combatStart", (c) => onCombatStart(c).catch((e) => console.error(MOD, e)));
 Hooks.on("updateCombat", (c, ch) => onUpdateCombat(c, ch).catch((e) => console.error(MOD, e)));
 Hooks.on("createCombatant", (c) => onCreateCombatant(c).catch((e) => console.error(MOD, e)));
@@ -2671,12 +2909,18 @@ Hooks.on("deleteCombat", (c) => onDeleteCombat(c).catch((e) => console.error(MOD
 let lastActive = null;
 Hooks.on("updateSetting", (setting) => {
   if (setting.key !== `${MOD}.index`) return;
-  if (!game.user.isGM) {
-    // Players refetch the running session, and the one that just ended (its final save lands after the index)
-    const active = Store.index.active;
+  const ix = Store.index;
+  const active = ix.active;
+  if (game.user.isGM && leading) {
+    // A session ended from another client (another GM, a macro): what the recorder remembered from it goes too
+    if (lastActive && active !== lastActive) Rec.forget(ix.sessions.find((s) => s.id === lastActive)?.end ?? now());
+    if (!tabs.isLead()) loseLead().catch((e) => console.error(MOD, e));
+  } else {
+    // Players and the GM's other tabs refetch the running session, and the one that just ended (its final save lands
+    // after the index)
     for (const id of new Set([active, lastActive])) if (id) Store.forget(id);
-    lastActive = active;
   }
+  lastActive = active;
   refreshOpenApps();
   if (!game.user.isGM) ChatArchiveApp.refresh();
 });

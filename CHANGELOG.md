@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.1
+
+- One GM with the world open in two browser tabs no longer records twice: only one tab records, and when another tab takes over, what each recorded is kept. Recaps and notices aren't posted twice.
+- A player's Revert on a damage card someone else posted is now taken back too: Foundry doesn't let them mark the card, so their client tells the recording GM which card it was.
+- Revert also takes back the Dying and death the card caused.
+- Damage a creature does to itself, and persistent damage whose source isn't known, goes to whoever last hit it only within the past minute, like other hand-applied damage.
+- Who put persistent damage on a creature is forgotten when that damage ends or the combat ends; recent hits and checks are forgotten when a session ends.
+- A reroll that turns a miss into a hit makes the attacker the last to hit the target (and a hit turned into a miss undoes that).
+- A recovery check that lowers Dying is no longer logged as "is dying".
+- The first HP change of a combatant on a scene the GM isn't viewing is recorded.
+- Two changes to the session list at the same moment (a rename as a roll starts a session, say) no longer undo each other.
+- New sessions are numbered one past the highest "Session N", so a deleted session's number isn't given out again.
+- Opening the ledger twice quickly no longer makes two windows.
+- Deleting a session or resetting the ledger says that archived chat stays on the server.
+- Import skips sessions whose id can't be a file name, and says how many; arcs and encounters with odd ids are left out.
+- A character renamed mid-campaign shows under its current name.
+- A damaged entry in a session file no longer stops the ledger from drawing.
+- Names in notices and tooltips show as plain text.
+- With "Record statistics" off, rounds and combatants joining aren't recorded either (an encounter still closes when combat ends).
+- Window size and place are kept per world and per user; the place saved before carries over.
+
 ## 1.1.0
 
 - Export a session's archived chat as Markdown: the button at the top of the Chat Archive window saves who spoke and when, what they wrote, and each roll's name, total and result, oldest first. The GM chooses the players' copy or the GM copy (whispers and DCs included); players get their copy.
