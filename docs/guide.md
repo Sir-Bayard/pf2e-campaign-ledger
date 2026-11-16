@@ -14,6 +14,14 @@ The GM's copy has a random file name and is listed on a GM-only journal entry, "
 
 **Deleted sessions.** Deleting a session, or resetting the ledger, leaves its archived chat on the server. The archive window lists it under "Deleted sessions" for the GM, unless you ticked "Take its archived chat off the list too" when deleting. The files themselves are never deleted by the ledger; remove them from the world's `pf2e-campaign-ledger` folder by hand if you want them gone.
 
+## Who was there
+
+With Bayard's Campaign Journal on, a session's "Who was there" comes from the "At the table" ticks of the Journal recap whose played date is the session's day: each ticked player's character, or the player's name when they have none. Without such a recap, it's the party characters who did something in the session (a Hero Point reset doesn't count). Each ended session keeps its totals in the session list, so the Sessions tab doesn't read every session file.
+
+## Quests
+
+With PF2e Campaign Trackers on, the recording GM notes when a quest is revealed and when an objective or step the players can see is marked done or failed, in the running session (Trackers keeps no time for these). Marked open again, it comes back out. Changes while no session is running aren't recorded, and don't start one. The recap counts them by quest.
+
 ## Correcting an entry
 
 Attribution is automatic and sometimes wrong. In an encounter's round-by-round log, the GM's pen on any line opens a small window: change who did it (or, for damage taken, a down, healing or a revive, who gets the credit), or delete the line. The change is saved with the session. A GM who has the world open in two tabs corrects the running session from the tab that's recording.
@@ -24,7 +32,7 @@ The page icon on the Sessions tab saves a session's numbers as a Markdown file: 
 
 ## Two GM tabs, and saving
 
-One GM with the world open in two browser tabs records once: the tabs agree which one records, and when that one closes or goes to sleep, another takes over. A roll made in the second or so while the recording tab is reloading may be missed, as it would be with a single tab. Each save reads the file first and keeps what the other tab added.
+One GM with the world open in two browser tabs records once: the tabs agree which one records, and when that one closes, reloads or goes to sleep, another takes over within a few seconds, with nothing missed. A tab that was only busy (a long scene load) and comes back may have handled the same rolls as the other tab meanwhile; those rolls, and changes to characters linked to their actors, count once. End session from the tab that isn't recording asks the recording tab to do it, so the session's last few seconds aren't left out. While another tab is open, each save reads the file first and keeps what the other tab added.
 
 Sessions save 30 seconds after the first unsaved event, at the end of each round, when combat ends and when the session ends. Players' open ledgers update after each save.
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0
+
+The rest of the code review.
+
+- The recap counts quests revealed and objectives done and failed (with PF2e Campaign Trackers), recorded as they happen. Only objectives the players can see count.
+- "Who was there" comes from the "At the table" ticks of a Bayard's Campaign Journal recap played that day, when there is one.
+- Each ended session keeps its totals, so the Sessions tab no longer reads every session file.
+- The market line in the recap uses PF2e Marketplace's own trade log reading, and leaves out vault deposits and withdrawals.
+- Persistent damage put on by an effect goes to the creature the effect came from.
+- Natural 20s and 1s leave out initiative.
+- Two GM tabs: End session in the tab that isn't recording is done by the one that is; a recording tab that reloads is taken over within a few seconds, with nothing missed; a roll or character change both tabs handled counts once.
+- A save no longer reads the file back first when the GM has only one tab open.
+- The table header and row highlights suit the light theme.
+- Encounters no longer store a list of combatants that was never shown.
+- Every word on screen is in `lang/en.json`, ready for translations.
+- The code is split into files by job.
+
 ## 1.2.0
 
 Everything from the code review in one release (1.1.1 was never released and is folded in here).

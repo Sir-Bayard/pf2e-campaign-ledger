@@ -29,7 +29,7 @@ Long-term table statistics for Pathfinder 2e: attacks, crits, damage dealt and t
 
 ![Sessions tab](docs/images/sessions.png)
 
-**Sessions.** Name sessions, group them into arcs, and export or import everything. The speech-bubble icon opens that session's archived chat.
+**Sessions.** Name sessions, group them into arcs, see who was there and how the party's numbers move from session to session, and export or import everything. The speech-bubble icon opens that session's archived chat; the page icon saves its numbers as Markdown.
 
 ## Install
 
@@ -63,7 +63,7 @@ The ledger and the chat archive remember their size and place, per world and use
 - **Characters**: One character in detail: attacks by weapon, saves, skills, spells, abilities and kills.
 - **Encounters**: Every combat. Open one for the per-combatant breakdown and a round-by-round log, which also shows damage and healing applied by hand. The GM can correct any line of the log (the pen): credit it to someone else, or delete it.
 - **Dice**: Every d20 rolled, as a chart of how often each number came up, with average, median, most common, natural 20s and 1s, and luck.
-- **Sessions**: Who was there, rename sessions, sort them into arcs, post a recap, save a session's numbers as Markdown, export, reset. With two sessions or more, small charts show the party's hit rate, damage dealt and taken and times downed, session by session.
+- **Sessions**: Who was there (from the "At the table" ticks of a Bayard's Campaign Journal recap played that day, when there is one; otherwise the characters who did something), rename sessions, sort them into arcs, post a recap, save a session's numbers as Markdown, export, reset. With two sessions or more, small charts show the party's hit rate, damage dealt and taken and times downed, session by session.
 
 ## Sessions and arcs
 
@@ -83,7 +83,7 @@ Deleting a session can take its archived chat off the list too; otherwise it sta
 
 ## Session recap
 
-Ending a session posts a recap card: who was there, biggest hit, most damage, most crits, foes felled, who went down and who brought them back, friendly fire, healing, natural 20s and 1s, and Hero Points spent. With the author's other modules on, it adds a line each for clues found (PF2e Campaign Trackers), money spent and earned at the market (PF2e Marketplace) and people met (PF2e NPC Attitudes). The "Session recap" setting sends it to everyone, to the GM, or nowhere.
+Ending a session posts a recap card: who was there, biggest hit, most damage, most crits, foes felled, who went down and who brought them back, friendly fire, healing, natural 20s and 1s, and Hero Points spent. With the author's other modules on, it adds a line each for quests revealed, objectives done and failed, and clues found (PF2e Campaign Trackers), money spent and earned at the market (PF2e Marketplace) and people met (PF2e NPC Attitudes). Only objectives the players can see count. The "Session recap" setting sends it to everyone, to the GM, or nowhere.
 
 ## Encounters
 
@@ -108,9 +108,10 @@ Turn off "Record statistics" for test rolls or a one-shot. Nothing is recorded u
 - **Damage is damage dealt**: what came off HP and temporary HP when damage was applied from a chat card, after resistances, not counting overkill. The amount rolled is shown alongside it. Healing works the same way.
 - **Friendly fire**: damage dealt to someone on your own side is counted apart, not as damage dealt. Damage a creature does to itself counts for nobody.
 - Damage taken is what came off a character's HP, however it was applied, plus any temporary HP that went with the same hit. Temporary HP that runs out isn't damage, and HP that rises with the maximum isn't healing.
-- Kills, downs and revives go to whoever applied the damage or healing. If HP was changed by hand, they go to whoever last hit (a hit, not a miss) or healed that creature in the past minute; failing that, to whoever's turn it is when they're on the other side (the same side, for healing); otherwise to nobody. Damage a creature does to itself, and persistent damage, goes to whoever put that damage on it, else to whoever last hit it in the past minute.
+- Kills, downs and revives go to whoever applied the damage or healing. If HP was changed by hand, they go to whoever last hit (a hit, not a miss) or healed that creature in the past minute; failing that, to whoever's turn it is when they're on the other side (the same side, for healing); otherwise to nobody. Damage a creature does to itself, and persistent damage, goes to whoever put that damage on it (the damage roll, or the creature an effect that put it on came from), else to whoever last hit it in the past minute.
 - The Revert button on a damage or healing card takes back everything recorded for that card, including a kill, down, revive, Dying or death it caused. When a player reverts a card someone else posted, their client tells the recording GM which card it was. PF2e leaves the Dying condition in place; remove it by hand if it shouldn't be there.
 - A party member's death counts once: Dying reaching its maximum, or being marked dead.
+- Natural 20s and 1s leave out initiative, which everyone rolls.
 - Hit % and save % count only rolls with a known result. Saves rolled from PF2e Toolbelt's Target Helper are recorded, and a reroll there replaces the earlier result.
 - Actions and feats count when their card is posted. The same character using the same ability within 5 seconds counts once.
 - "Saves forced" credits a spell or ability's user with the saves it forced on the other side (failed / rolled). "Skills" is skill checks that succeeded / checks against a DC, initiative left out.
@@ -125,7 +126,11 @@ A macro that posts its own chat message counts as an ability use with the flag `
 
 ## Where the data lives
 
-One JSON file per session in `Data/worlds/<your world>/pf2e-campaign-ledger/`, one per chat archive beside them, and the list of sessions and arcs in a world setting. Back up the world folder and you've backed up the ledger.
+One JSON file per session in `Data/worlds/<your world>/pf2e-campaign-ledger/`, one per chat archive beside them, and the list of sessions and arcs (with each ended session's totals for the Sessions tab) in a world setting. Back up the world folder and you've backed up the ledger.
+
+## Translations
+
+Every word the module shows is in `lang/en.json`. A translation is a copy of that file in another language, listed in `module.json`; none ships yet.
 
 ## Changes
 
