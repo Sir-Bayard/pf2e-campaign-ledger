@@ -46,7 +46,7 @@ const partyColumns = () => [
   { key: "healDone", label: L("ColHealing"), group: L("GroupSupport"), tip: L("TipHealing"), tipf: (a) => L("Rolled", { n: a.heal }) },
   { key: "revivedBy", label: L("ColRevived"), group: L("GroupSupport"), tip: L("TipRevived") },
   { key: "saveRate", label: L("ColSaves"), group: L("GroupDice"), fmt: (a) => pct(a.savePass, a.saveN), tip: L("TipSaves") },
-  { key: "nat20", label: L("ColNat"), group: L("GroupDice"), fmt: (a) => (a.nat20 || a.nat1 ? `${a.nat20} / ${a.nat1}` : "–"), tip: L("TipNat") },
+  { key: "nat20", label: L("ColNat"), group: L("GroupDice"), fmt: (a) => (a.nat20 || a.nat1 ? `${a.nat20} / ${a.nat1}` : "–"), tip: L(game.settings.get(MOD, "initiativeNat") === false ? "TipNatNoInitiative" : "TipNat") },
   { key: "hero", label: L("ColHero"), group: L("GroupDice"), tip: L("TipHero") },
   { key: "rerolls", label: L("ColRerolls"), group: L("GroupDice"), fmt: (a) => (a.rerolls ? `${a.rerollsBetter}/${a.rerolls}` : "–"), tip: L("TipRerolls") },
 ];

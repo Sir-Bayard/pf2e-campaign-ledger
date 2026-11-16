@@ -111,7 +111,7 @@ Turn off "Record statistics" for test rolls or a one-shot. Nothing is recorded u
 - Kills, downs and revives go to whoever applied the damage or healing. If HP was changed by hand, they go to whoever last hit (a hit, not a miss) or healed that creature in the past minute; failing that, to whoever's turn it is when they're on the other side (the same side, for healing); otherwise to nobody. Damage a creature does to itself, and persistent damage, goes to whoever put that damage on it (the damage roll, or the creature an effect that put it on came from), else to whoever last hit it in the past minute.
 - The Revert button on a damage or healing card takes back everything recorded for that card, including a kill, down, revive, Dying or death it caused. When a player reverts a card someone else posted, their client tells the recording GM which card it was. PF2e leaves the Dying condition in place; remove it by hand if it shouldn't be there.
 - A party member's death counts once: Dying reaching its maximum, or being marked dead.
-- Natural 20s and 1s leave out initiative, which everyone rolls.
+- Natural 20s and 1s count initiative too; turn off "Count initiative in natural 20s and 1s" to leave it out.
 - Hit % and save % count only rolls with a known result. Saves rolled from PF2e Toolbelt's Target Helper are recorded, and a reroll there replaces the earlier result.
 - Actions and feats count when their card is posted. The same character using the same ability within 5 seconds counts once.
 - "Saves forced" credits a spell or ability's user with the saves it forced on the other side (failed / rolled). "Skills" is skill checks that succeeded / checks against a DC, initiative left out.

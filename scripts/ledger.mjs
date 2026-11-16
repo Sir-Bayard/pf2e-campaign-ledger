@@ -129,6 +129,12 @@ Hooks.once("init", () => {
     hint: "PCL.SettingNeedPlayerHint",
     scope: "world", config: true, type: Boolean, default: true,
   });
+  game.settings.register(MOD, "initiativeNat", {
+    name: "PCL.SettingInitiativeNatName",
+    hint: "PCL.SettingInitiativeNatHint",
+    scope: "world", config: true, type: Boolean, default: true,
+    onChange: () => refreshOpenApps(),
+  });
   game.settings.register(MOD, "sessionGap", {
     name: "PCL.SettingSessionGapName",
     hint: "PCL.SettingSessionGapHint",

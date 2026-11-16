@@ -22,6 +22,7 @@ function weaponRow() {
 }
 
 function aggregate(events) {
+  const initNat = game.settings.get(MOD, "initiativeNat") !== false;
   const by = new Map();
   const get = (w) => {
     if (typeof w?.k !== "string" || !w.k) return null;
@@ -43,8 +44,8 @@ function aggregate(events) {
       continue;
     }
     if (a && e.e) a.encounters.add(e.e);
-    // Initiative, which everyone rolls, isn't counted (as with skills)
-    const counts = a && e.k !== "reroll" && !(e.k === "skill" && e.s === "initiative");
+    // Initiative, which everyone rolls, counts toward natural 20s and 1s only when the GM's setting says so
+    const counts = a && e.k !== "reroll" && (initNat || !(e.k === "skill" && e.s === "initiative"));
     if (e.nat === 20 && counts) a.nat20++;
     if (e.nat === 1 && counts) a.nat1++;
     switch (e.k) {
